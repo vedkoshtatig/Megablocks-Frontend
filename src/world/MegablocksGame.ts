@@ -22,11 +22,7 @@ const LANDING_SHAKE_STRENGTH = 0.16;
 const STACK_DROP_HEIGHT = 7;
 const STACK_DROP_SECONDS = 0.5;
 const FALLBACK_STACK_ANCHOR = new THREE.Vector3(0, 0, 0);
-const STACK_PARTS = [
-  {
-    label: 'Ground floor',
-    url: '/assets/models/ground.glb'
-  },
+const FIRST_FLOOR_PARTS = [
   {
     label: 'Lower first floor',
     url: '/assets/models/lowerFirst.glb'
@@ -34,12 +30,12 @@ const STACK_PARTS = [
   {
     label: 'Upper first floor',
     url: '/assets/models/firstUpper.glb'
-  },
-  {
-    label: 'Upper with roof',
-    url: '/assets/models/upperWithRoof.glb'
   }
 ] as const;
+const ROOF_PART = {
+  label: 'Upper with roof',
+  url: '/assets/models/upperWithRoof.glb'
+} as const;
 
 type StackPart = {
   baseRotationY: number;
@@ -183,7 +179,7 @@ export class MegablocksGame {
     this.activeDrop = null;
 
     const templates = await Promise.all(
-      STACK_PARTS.map(async (part) => ({
+      [...FIRST_FLOOR_PARTS, ROOF_PART].map(async (part) => ({
         definition: part,
         object: (await loader.loadAsync(getAssetUrl(part.url))).scene
       }))
@@ -191,7 +187,10 @@ export class MegablocksGame {
     let nextTopY = this.stackAnchor.topY;
 
     for (let index = 0; index < TOTAL_STACK_BLOCKS; index += 1) {
-      const template = templates[index % templates.length];
+      const isLastBlock = index === TOTAL_STACK_BLOCKS - 1;
+      const template = isLastBlock
+        ? templates[templates.length - 1]
+        : templates[index % FIRST_FLOOR_PARTS.length];
       const object = template.object.clone(true);
       const label = `Block ${index + 1} (${template.definition.label})`;
 
