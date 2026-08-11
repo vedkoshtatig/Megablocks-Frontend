@@ -1,0 +1,19 @@
+{
+  "name": "megablock3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "export:blend": "blender -b megablocks.blend --python scripts/export-blend-to-glb.py -- public/assets/models/megablocks.glb"
+  },
+  "dependencies": {
+    "@types/three": "^0.167.2",
+    "vite": "^5.4.19",
+    "typescript": "^5.5.4",
+    "three": "^0.167.1"
+  },
+  "devDependencies": {}
+}

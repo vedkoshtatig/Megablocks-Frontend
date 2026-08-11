@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>Megablocks 3D</title>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <div class="hud" aria-label="Game HUD">
+      <div class="hud__brand">Megablocks 3D</div>
+      <div class="hud__stats">
+        <span id="fps">-- fps</span>
+        <span id="status">Loading scene</span>
+      </div>
+    </div>
+    <button class="stack-button" id="stack-next" type="button" disabled>Drop next floor</button>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
