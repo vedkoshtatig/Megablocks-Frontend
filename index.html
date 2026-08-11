@@ -15,6 +15,18 @@
         <span id="status">Loading scene</span>
       </div>
     </div>
+    <div class="camera-scroll" aria-label="Camera height control">
+      <span aria-hidden="true">↑</span>
+      <input
+        id="camera-height"
+        type="range"
+        min="0"
+        max="1000"
+        value="0"
+        aria-label="Move camera up or down the building"
+      />
+      <span aria-hidden="true">↓</span>
+    </div>
     <button class="stack-button" id="stack-next" type="button" disabled>Drop next floor</button>
     <script type="module" src="/src/main.ts"></script>
   </body>

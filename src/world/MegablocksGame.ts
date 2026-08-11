@@ -17,6 +17,7 @@ const STACK_RANDOM_Z_ROTATION_DEGREES = 12;
 const TOTAL_STACK_BLOCKS = 25;
 const CAMERA_TOP_PADDING = 3;
 const CAMERA_VIEW_TOP_LIMIT = 0.72;
+const SLIDER_ORBIT_DEGREES_PER_HEIGHT_UNIT = 9;
 const LANDING_SHAKE_DURATION = 0.28;
 const LANDING_SHAKE_STRENGTH = 0.16;
 const STACK_DROP_HEIGHT = 7;
@@ -78,6 +79,7 @@ export class MegablocksGame {
   private readonly statusElement = document.querySelector<HTMLElement>('#status');
   private readonly fpsElement = document.querySelector<HTMLElement>('#fps');
   private readonly stackButton = document.querySelector<HTMLButtonElement>('#stack-next');
+  private readonly cameraHeightElement = document.querySelector<HTMLInputElement>('#camera-height');
   private readonly stackParts: StackPart[] = [];
   private activeDrop: ActiveDrop | null = null;
   private stackAnchor: StackAnchor = {
@@ -120,6 +122,7 @@ export class MegablocksGame {
 
     this.configureScene();
     this.stackButton?.addEventListener('click', this.dropNextFloor);
+    this.cameraHeightElement?.addEventListener('input', this.moveCameraFromSlider);
     window.addEventListener('resize', this.resize);
   }
 
@@ -404,6 +407,7 @@ export class MegablocksGame {
     this.updateStackAnimation(delta);
     this.controls.update();
     this.updateCameraHeight(delta);
+    this.updateCameraSlider();
     this.updateFps(delta);
     const shakeOffset = this.getLandingShakeOffset(delta);
     this.camera.position.add(shakeOffset);
@@ -446,7 +450,11 @@ export class MegablocksGame {
     this.camera.updateMatrixWorld();
     const projectedTop = stackTop.project(this.camera);
 
-    if (projectedTop.y > CAMERA_VIEW_TOP_LIMIT && this.controls.target.y < maxTargetY) {
+    if (
+      this.activeDrop &&
+      projectedTop.y > CAMERA_VIEW_TOP_LIMIT &&
+      this.controls.target.y < maxTargetY
+    ) {
       const overflow = projectedTop.y - CAMERA_VIEW_TOP_LIMIT;
       const desiredShift = overflow * this.camera.position.distanceTo(this.controls.target) * 0.45;
       const smoothShift = desiredShift * Math.min(delta * 6, 1);
@@ -464,6 +472,45 @@ export class MegablocksGame {
 
     this.camera.position.y += amount;
     this.controls.target.y += amount;
+  }
+
+  private moveCameraFromSlider = (): void => {
+    if (!this.cameraHeightElement) {
+      return;
+    }
+
+    const maxTargetY = Math.max(this.cameraTargetMinY, this.currentStackTopY + CAMERA_TOP_PADDING);
+    const sliderMin = Number(this.cameraHeightElement.min);
+    const sliderMax = Number(this.cameraHeightElement.max);
+    const ratio = (Number(this.cameraHeightElement.value) - sliderMin) / (sliderMax - sliderMin);
+    const desiredTargetY = THREE.MathUtils.lerp(this.cameraTargetMinY, maxTargetY, ratio);
+    const verticalMovement = desiredTargetY - this.controls.target.y;
+
+    this.shiftCameraVertically(verticalMovement);
+    const cameraOffset = this.camera.position.clone().sub(this.controls.target);
+    cameraOffset.applyAxisAngle(
+      new THREE.Vector3(0, 1, 0),
+      THREE.MathUtils.degToRad(-verticalMovement * SLIDER_ORBIT_DEGREES_PER_HEIGHT_UNIT)
+    );
+    this.camera.position.copy(this.controls.target).add(cameraOffset);
+    this.controls.update();
+  };
+
+  private updateCameraSlider(): void {
+    if (!this.cameraHeightElement) {
+      return;
+    }
+
+    const maxTargetY = Math.max(this.cameraTargetMinY, this.currentStackTopY + CAMERA_TOP_PADDING);
+    const heightRange = maxTargetY - this.cameraTargetMinY;
+    const ratio = heightRange
+      ? THREE.MathUtils.clamp((this.controls.target.y - this.cameraTargetMinY) / heightRange, 0, 1)
+      : 0;
+    const sliderMin = Number(this.cameraHeightElement.min);
+    const sliderMax = Number(this.cameraHeightElement.max);
+    this.cameraHeightElement.value = String(
+      Math.round(THREE.MathUtils.lerp(sliderMin, sliderMax, ratio))
+    );
   }
 
   private updateFps(delta: number): void {
