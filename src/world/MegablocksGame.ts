@@ -6,8 +6,21 @@ import { createPlaceholderBlocks } from './placeholderBlocks';
 
 const MODEL_URL = '/assets/models/megablocks.glb';
 const HIDDEN_MODEL_OBJECTS = new Set(['Cube_Material_0.001']);
+const ORBIT_TARGET_OBJECT = 'MOVABLE_Ground_Floor';
+const MAX_ORBIT_DISTANCE = 38;
+// Blender X/Y map to Three.js X/Z after GLB's Y-up conversion.
+// Each value is the maximum random distance in either direction.
+const STACK_RANDOM_X_RANGE = 1.4;
+const STACK_RANDOM_BLENDER_Y_RANGE = 1.4;
+// Blender Z rotation maps to Three.js Y rotation after export.
+const STACK_RANDOM_Z_ROTATION_DEGREES = 12;
+const TOTAL_STACK_BLOCKS = 25;
+const CAMERA_TOP_PADDING = 3;
+const CAMERA_VIEW_TOP_LIMIT = 0.72;
+const LANDING_SHAKE_DURATION = 0.28;
+const LANDING_SHAKE_STRENGTH = 0.16;
 const STACK_DROP_HEIGHT = 7;
-const STACK_DROP_SECONDS = 1.05;
+const STACK_DROP_SECONDS = 0.5;
 const FALLBACK_STACK_ANCHOR = new THREE.Vector3(0, 0, 0);
 const STACK_PARTS = [
   {
@@ -29,13 +42,19 @@ const STACK_PARTS = [
 ] as const;
 
 type StackPart = {
+  baseRotationY: number;
+  baseX: number;
+  baseZ: number;
   finalY: number;
   label: string;
   object: THREE.Object3D;
+  topY: number;
 };
 
 type StackAnchor = {
   center: THREE.Vector3;
+  halfWidthX: number;
+  halfWidthZ: number;
   topY: number;
 };
 
@@ -67,11 +86,16 @@ export class MegablocksGame {
   private activeDrop: ActiveDrop | null = null;
   private stackAnchor: StackAnchor = {
     center: FALLBACK_STACK_ANCHOR.clone(),
+    halfWidthX: STACK_RANDOM_X_RANGE,
+    halfWidthZ: STACK_RANDOM_BLENDER_Y_RANGE,
     topY: 0
   };
   private frameCount = 0;
   private fpsTimer = 0;
   private stackIndex = 0;
+  private cameraTargetMinY = 0;
+  private currentStackTopY = 0;
+  private landingShakeRemaining = 0;
 
   constructor(private readonly canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({
@@ -90,8 +114,11 @@ export class MegablocksGame {
 
     this.controls = new OrbitControls(this.camera, this.canvas);
     this.controls.enableDamping = true;
+    this.controls.enablePan = true;
+    this.controls.screenSpacePanning = true;
     this.controls.target.set(0, 1.2, 0);
     this.controls.maxPolarAngle = Math.PI * 0.48;
+    this.controls.maxDistance = MAX_ORBIT_DISTANCE;
 
     this.player = new PlayerController();
 
@@ -137,7 +164,9 @@ export class MegablocksGame {
 
       this.useImportedCamera(gltf.cameras);
       this.scene.add(world);
-      this.stackAnchor = this.measureStackAnchor(world);
+      this.focusControlsOnObject(world, ORBIT_TARGET_OBJECT);
+      this.stackAnchor = this.measureStackAnchor(world, ORBIT_TARGET_OBJECT);
+      this.currentStackTopY = this.stackAnchor.topY;
       await this.loadStackAssets(loader);
       this.updateStackButton();
       this.setStatus(this.stackParts.length ? 'Ready to stack floors' : 'Scene loaded');
@@ -153,13 +182,20 @@ export class MegablocksGame {
     this.stackIndex = 0;
     this.activeDrop = null;
 
+    const templates = await Promise.all(
+      STACK_PARTS.map(async (part) => ({
+        definition: part,
+        object: (await loader.loadAsync(getAssetUrl(part.url))).scene
+      }))
+    );
     let nextTopY = this.stackAnchor.topY;
 
-    for (const part of STACK_PARTS) {
-      const gltf = await loader.loadAsync(getAssetUrl(part.url));
-      const object = gltf.scene;
+    for (let index = 0; index < TOTAL_STACK_BLOCKS; index += 1) {
+      const template = templates[index % templates.length];
+      const object = template.object.clone(true);
+      const label = `Block ${index + 1} (${template.definition.label})`;
 
-      object.name = part.label;
+      object.name = label;
       this.prepareSceneObject(object);
       this.scene.add(object);
       object.visible = false;
@@ -169,9 +205,13 @@ export class MegablocksGame {
       nextTopY = finalBox.max.y;
 
       this.stackParts.push({
+        baseRotationY: object.rotation.y,
+        baseX: object.position.x,
+        baseZ: object.position.z,
         finalY,
-        label: part.label,
-        object
+        label,
+        object,
+        topY: finalBox.max.y
       });
     }
   }
@@ -190,7 +230,47 @@ export class MegablocksGame {
     });
   }
 
-  private measureStackAnchor(world: THREE.Object3D): StackAnchor {
+  private focusControlsOnObject(root: THREE.Object3D, objectName: string): void {
+    const targetObject = root.getObjectByName(objectName);
+
+    if (!targetObject) {
+      console.warn(`Orbit target "${objectName}" was not found in ${MODEL_URL}.`);
+      return;
+    }
+
+    targetObject.updateWorldMatrix(true, true);
+    const targetBox = new THREE.Box3().setFromObject(targetObject);
+
+    if (targetBox.isEmpty()) {
+      targetObject.getWorldPosition(this.controls.target);
+    } else {
+      targetBox.getCenter(this.controls.target);
+    }
+
+    this.cameraTargetMinY = this.controls.target.y;
+    this.controls.update();
+  }
+
+  private measureStackAnchor(world: THREE.Object3D, anchorName: string): StackAnchor {
+    const anchorObject = world.getObjectByName(anchorName);
+
+    if (anchorObject) {
+      anchorObject.updateWorldMatrix(true, true);
+      const anchorBox = new THREE.Box3().setFromObject(anchorObject);
+
+      if (!anchorBox.isEmpty()) {
+        const size = anchorBox.getSize(new THREE.Vector3());
+
+        return {
+          center: anchorBox.getCenter(new THREE.Vector3()),
+          halfWidthX: size.x / 2,
+          halfWidthZ: size.z / 2,
+          topY: anchorBox.max.y
+        };
+      }
+    }
+
+    console.warn(`Stack anchor "${anchorName}" was not found. Using the measured world bounds.`);
     const preciseBox = new THREE.Box3();
     const broadBox = new THREE.Box3().setFromObject(world);
     let hasPreciseBox = false;
@@ -218,9 +298,12 @@ export class MegablocksGame {
 
     const box = hasPreciseBox ? preciseBox : broadBox;
     const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
 
     return {
       center,
+      halfWidthX: size.x / 2,
+      halfWidthZ: size.z / 2,
       topY: box.max.y
     };
   }
@@ -245,8 +328,17 @@ export class MegablocksGame {
     }
 
     const part = this.stackParts[this.stackIndex];
+    const xRange = Math.min(STACK_RANDOM_X_RANGE, this.stackAnchor.halfWidthX);
+    const zRange = Math.min(STACK_RANDOM_BLENDER_Y_RANGE, this.stackAnchor.halfWidthZ);
+
     part.object.visible = true;
+    part.object.position.x = part.baseX + THREE.MathUtils.randFloatSpread(xRange * 2);
+    part.object.position.z = part.baseZ + THREE.MathUtils.randFloatSpread(zRange * 2);
     part.object.position.y = part.finalY + STACK_DROP_HEIGHT;
+    part.object.rotation.y =
+      part.baseRotationY +
+      THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(STACK_RANDOM_Z_ROTATION_DEGREES * 2));
+    this.currentStackTopY = Math.max(this.currentStackTopY, part.topY);
     this.activeDrop = {
       elapsed: 0,
       part,
@@ -276,12 +368,14 @@ export class MegablocksGame {
     drop.elapsed += delta;
 
     const progress = Math.min(drop.elapsed / STACK_DROP_SECONDS, 1);
-    const eased = 1 - Math.pow(1 - progress, 3);
+    // Gravity-like acceleration: slow at release and fast immediately before impact.
+    const eased = Math.pow(progress, 2.35);
     drop.part.object.position.y = THREE.MathUtils.lerp(drop.startY, drop.part.finalY, eased);
 
     if (progress >= 1) {
       drop.part.object.position.y = drop.part.finalY;
       this.activeDrop = null;
+      this.landingShakeRemaining = LANDING_SHAKE_DURATION;
       this.updateStackButton();
       this.setStatus(this.stackIndex >= this.stackParts.length ? 'Building stacked' : 'Ready for next floor');
     }
@@ -310,9 +404,68 @@ export class MegablocksGame {
     this.player.update(delta);
     this.updateStackAnimation(delta);
     this.controls.update();
+    this.updateCameraHeight(delta);
     this.updateFps(delta);
+    const shakeOffset = this.getLandingShakeOffset(delta);
+    this.camera.position.add(shakeOffset);
     this.renderer.render(this.scene, this.camera);
+    this.camera.position.sub(shakeOffset);
   };
+
+  private getLandingShakeOffset(delta: number): THREE.Vector3 {
+    if (this.landingShakeRemaining <= 0) {
+      return new THREE.Vector3();
+    }
+
+    this.landingShakeRemaining = Math.max(this.landingShakeRemaining - delta, 0);
+    const strength =
+      LANDING_SHAKE_STRENGTH * (this.landingShakeRemaining / LANDING_SHAKE_DURATION);
+
+    return new THREE.Vector3(
+      THREE.MathUtils.randFloatSpread(strength * 2),
+      THREE.MathUtils.randFloatSpread(strength),
+      THREE.MathUtils.randFloatSpread(strength * 0.7)
+    );
+  }
+
+  private updateCameraHeight(delta: number): void {
+    const maxTargetY = Math.max(this.cameraTargetMinY, this.currentStackTopY + CAMERA_TOP_PADDING);
+
+    // Keep manual right-mouse panning between the original view and the stack top.
+    const clampedTargetY = THREE.MathUtils.clamp(
+      this.controls.target.y,
+      this.cameraTargetMinY,
+      maxTargetY
+    );
+    this.shiftCameraVertically(clampedTargetY - this.controls.target.y);
+
+    const stackTop = new THREE.Vector3(
+      this.stackAnchor.center.x,
+      this.currentStackTopY,
+      this.stackAnchor.center.z
+    );
+    this.camera.updateMatrixWorld();
+    const projectedTop = stackTop.project(this.camera);
+
+    if (projectedTop.y > CAMERA_VIEW_TOP_LIMIT && this.controls.target.y < maxTargetY) {
+      const overflow = projectedTop.y - CAMERA_VIEW_TOP_LIMIT;
+      const desiredShift = overflow * this.camera.position.distanceTo(this.controls.target) * 0.45;
+      const smoothShift = desiredShift * Math.min(delta * 6, 1);
+      const availableShift = maxTargetY - this.controls.target.y;
+      this.shiftCameraVertically(Math.min(smoothShift, availableShift));
+    }
+
+    this.controls.update();
+  }
+
+  private shiftCameraVertically(amount: number): void {
+    if (amount === 0) {
+      return;
+    }
+
+    this.camera.position.y += amount;
+    this.controls.target.y += amount;
+  }
 
   private updateFps(delta: number): void {
     this.frameCount += 1;
