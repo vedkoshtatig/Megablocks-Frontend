@@ -20,8 +20,18 @@ const CAMERA_VIEW_TOP_LIMIT = 0.72;
 const SLIDER_ORBIT_DEGREES_PER_HEIGHT_UNIT = 9;
 const LANDING_SHAKE_DURATION = 0.28;
 const LANDING_SHAKE_STRENGTH = 0.16;
+const COLLAPSE_AT_BLOCK = 10;
+const COLLAPSE_GRAVITY = 18;
+const BAD_LANDING_TILT_DEGREES = 14;
+const COLLAPSE_CAMERA_FOLLOW_SPEED = 5;
+const CAMERA_BASE_RETURN_SPEED = 2.8;
+const DESTROY_BELOW_GROUND_DISTANCE = 4;
 const STACK_DROP_HEIGHT = 7;
 const STACK_DROP_SECONDS = 0.5;
+const STACK_VERTICAL_OVERLAP = 0.05;
+const STACK_CONTACT_PROGRESS = 0.82;
+const STACK_SWING_DEGREES = 4.5;
+const STACK_IMPACT_COMPRESSION = 0.045;
 const FALLBACK_STACK_ANCHOR = new THREE.Vector3(0, 0, 0);
 const FIRST_FLOOR_PARTS = [
   {
@@ -39,7 +49,10 @@ const ROOF_PART = {
 } as const;
 
 type StackPart = {
+  baseRotationX: number;
   baseRotationY: number;
+  baseRotationZ: number;
+  baseScale: THREE.Vector3;
   baseX: number;
   baseZ: number;
   finalY: number;
@@ -56,9 +69,23 @@ type StackAnchor = {
 };
 
 type ActiveDrop = {
+  baseRotationX: number;
+  baseRotationZ: number;
+  baseScale: THREE.Vector3;
   elapsed: number;
+  hasImpacted: boolean;
   part: StackPart;
   startY: number;
+  swingDirection: number;
+  swingPhase: number;
+};
+
+type CollapsingBlock = {
+  angularVelocity: THREE.Vector3;
+  delay: number;
+  object: THREE.Object3D;
+  startY: number;
+  velocity: THREE.Vector3;
 };
 
 function getModelUrl(): string {
@@ -79,8 +106,11 @@ export class MegablocksGame {
   private readonly statusElement = document.querySelector<HTMLElement>('#status');
   private readonly fpsElement = document.querySelector<HTMLElement>('#fps');
   private readonly stackButton = document.querySelector<HTMLButtonElement>('#stack-next');
+  private readonly resetButton = document.querySelector<HTMLButtonElement>('#reset-round');
   private readonly cameraHeightElement = document.querySelector<HTMLInputElement>('#camera-height');
   private readonly stackParts: StackPart[] = [];
+  private readonly collapseAtBlock = THREE.MathUtils.clamp(COLLAPSE_AT_BLOCK, 1, TOTAL_STACK_BLOCKS);
+  private readonly collapsingBlocks: CollapsingBlock[] = [];
   private activeDrop: ActiveDrop | null = null;
   private stackAnchor: StackAnchor = {
     center: FALLBACK_STACK_ANCHOR.clone(),
@@ -93,7 +123,11 @@ export class MegablocksGame {
   private stackIndex = 0;
   private cameraTargetMinY = 0;
   private currentStackTopY = 0;
+  private collapseCameraStartTargetY = 0;
   private landingShakeRemaining = 0;
+  private awaitingRoundRestart = false;
+  private returningCameraToBase = false;
+  private resetInProgress = false;
 
   constructor(private readonly canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({
@@ -122,6 +156,7 @@ export class MegablocksGame {
 
     this.configureScene();
     this.stackButton?.addEventListener('click', this.dropNextFloor);
+    this.resetButton?.addEventListener('click', this.resetRound);
     this.cameraHeightElement?.addEventListener('input', this.moveCameraFromSlider);
     window.addEventListener('resize', this.resize);
   }
@@ -202,12 +237,15 @@ export class MegablocksGame {
       this.scene.add(object);
       object.visible = false;
 
-      const finalY = this.placePartOnStack(object, nextTopY);
+      const finalY = this.placePartOnStack(object, nextTopY - STACK_VERTICAL_OVERLAP);
       const finalBox = new THREE.Box3().setFromObject(object);
       nextTopY = finalBox.max.y;
 
       this.stackParts.push({
+        baseRotationX: object.rotation.x,
         baseRotationY: object.rotation.y,
+        baseRotationZ: object.rotation.z,
+        baseScale: object.scale.clone(),
         baseX: object.position.x,
         baseZ: object.position.z,
         finalY,
@@ -325,6 +363,13 @@ export class MegablocksGame {
   }
 
   private dropNextFloor = (): void => {
+    if (this.awaitingRoundRestart) {
+      this.awaitingRoundRestart = false;
+      this.updateStackButton();
+      this.setStatus('Ready for next floor');
+      return;
+    }
+
     if (this.activeDrop || this.stackIndex >= this.stackParts.length) {
       return;
     }
@@ -342,9 +387,15 @@ export class MegablocksGame {
       THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(STACK_RANDOM_Z_ROTATION_DEGREES * 2));
     this.currentStackTopY = Math.max(this.currentStackTopY, part.topY);
     this.activeDrop = {
+      baseRotationX: part.object.rotation.x,
+      baseRotationZ: part.object.rotation.z,
+      baseScale: part.object.scale.clone(),
       elapsed: 0,
+      hasImpacted: false,
       part,
-      startY: part.object.position.y
+      startY: part.object.position.y,
+      swingDirection: Math.random() < 0.5 ? -1 : 1,
+      swingPhase: Math.random() * Math.PI * 2
     };
     this.stackIndex += 1;
     this.updateStackButton();
@@ -370,18 +421,182 @@ export class MegablocksGame {
     drop.elapsed += delta;
 
     const progress = Math.min(drop.elapsed / STACK_DROP_SECONDS, 1);
-    // Gravity-like acceleration: slow at release and fast immediately before impact.
-    const eased = Math.pow(progress, 2.35);
-    drop.part.object.position.y = THREE.MathUtils.lerp(drop.startY, drop.part.finalY, eased);
+    const fallProgress = Math.min(progress / STACK_CONTACT_PROGRESS, 1);
+    const gravityProgress = fallProgress * fallProgress;
+    drop.part.object.position.y = THREE.MathUtils.lerp(
+      drop.startY,
+      drop.part.finalY,
+      gravityProgress
+    );
+
+    const swing =
+      THREE.MathUtils.degToRad(STACK_SWING_DEGREES) *
+      Math.sin(drop.swingPhase + fallProgress * Math.PI * 2.2) *
+      Math.pow(1 - fallProgress, 0.7);
+    drop.part.object.rotation.x = drop.baseRotationX + swing;
+    drop.part.object.rotation.z = drop.baseRotationZ + swing * 0.55 * drop.swingDirection;
+
+    if (progress >= STACK_CONTACT_PROGRESS) {
+      if (!drop.hasImpacted) {
+        drop.hasImpacted = true;
+        this.landingShakeRemaining = LANDING_SHAKE_DURATION;
+      }
+
+      const impactProgress =
+        (progress - STACK_CONTACT_PROGRESS) / (1 - STACK_CONTACT_PROGRESS);
+      const compression = Math.sin(impactProgress * Math.PI) * STACK_IMPACT_COMPRESSION;
+      drop.part.object.scale.set(
+        drop.baseScale.x * (1 + compression * 0.45),
+        drop.baseScale.y * (1 - compression),
+        drop.baseScale.z * (1 + compression * 0.45)
+      );
+    }
 
     if (progress >= 1) {
       drop.part.object.position.y = drop.part.finalY;
+      drop.part.object.rotation.x = drop.baseRotationX;
+      drop.part.object.rotation.z = drop.baseRotationZ;
+      drop.part.object.scale.copy(drop.baseScale);
       this.activeDrop = null;
-      this.landingShakeRemaining = LANDING_SHAKE_DURATION;
+
+      if (this.stackIndex === this.collapseAtBlock) {
+        drop.part.object.rotation.z += THREE.MathUtils.degToRad(
+          BAD_LANDING_TILT_DEGREES * (Math.random() < 0.5 ? -1 : 1)
+        );
+        this.startTowerCollapse();
+        return;
+      }
+
       this.updateStackButton();
       this.setStatus(this.stackIndex >= this.stackParts.length ? 'Building stacked' : 'Ready for next floor');
     }
   }
+
+  private startTowerCollapse(): void {
+    this.collapsingBlocks.length = 0;
+    this.collapseCameraStartTargetY = this.controls.target.y;
+
+    for (const [index, part] of this.stackParts.slice(0, this.stackIndex).entries()) {
+      if (!part.object.visible) {
+        continue;
+      }
+
+      this.collapsingBlocks.push({
+        angularVelocity: new THREE.Vector3(
+          THREE.MathUtils.randFloatSpread(2.4),
+          THREE.MathUtils.randFloatSpread(1.4),
+          THREE.MathUtils.randFloatSpread(2.4)
+        ),
+        delay: (this.stackIndex - index - 1) * 0.025 + Math.random() * 0.08,
+        object: part.object,
+        startY: part.object.position.y,
+        velocity: new THREE.Vector3(
+          THREE.MathUtils.randFloatSpread(3.5),
+          Math.random() * 1.5,
+          THREE.MathUtils.randFloatSpread(3.5)
+        )
+      });
+    }
+
+    if (this.stackButton) {
+      this.stackButton.disabled = true;
+      this.stackButton.textContent = 'Tower collapsing';
+    }
+    this.setStatus(`Block ${this.collapseAtBlock} landed badly!`);
+  }
+
+  private updateTowerCollapse(delta: number): void {
+    if (!this.collapsingBlocks.length) {
+      return;
+    }
+
+    let visibleBlocks = 0;
+    let totalFallDistance = 0;
+
+    for (const block of this.collapsingBlocks) {
+      if (!block.object.visible) {
+        continue;
+      }
+
+      visibleBlocks += 1;
+      block.delay -= delta;
+
+      if (block.delay > 0) {
+        totalFallDistance += Math.max(block.startY - block.object.position.y, 0);
+        continue;
+      }
+
+      block.velocity.y -= COLLAPSE_GRAVITY * delta;
+      block.object.position.addScaledVector(block.velocity, delta);
+      block.object.rotation.x += block.angularVelocity.x * delta;
+      block.object.rotation.y += block.angularVelocity.y * delta;
+      block.object.rotation.z += block.angularVelocity.z * delta;
+      totalFallDistance += Math.max(block.startY - block.object.position.y, 0);
+
+      if (block.object.position.y < this.stackAnchor.topY - DESTROY_BELOW_GROUND_DISTANCE) {
+        block.object.visible = false;
+        block.object.removeFromParent();
+      }
+    }
+
+    if (visibleBlocks > 0) {
+      const averageFallDistance = totalFallDistance / visibleBlocks;
+      const desiredCameraY = Math.max(
+        this.cameraTargetMinY,
+        this.collapseCameraStartTargetY - averageFallDistance
+      );
+      const smoothing = 1 - Math.exp(-delta * COLLAPSE_CAMERA_FOLLOW_SPEED);
+      this.shiftCameraVertically((desiredCameraY - this.controls.target.y) * smoothing);
+    }
+
+    if (visibleBlocks === 0) {
+      this.collapsingBlocks.length = 0;
+      this.returningCameraToBase = true;
+      this.resetStackPool();
+      this.awaitingRoundRestart = true;
+      this.setStatus('Tower collapsed');
+      if (this.stackButton) {
+        this.stackButton.disabled = true;
+        this.stackButton.textContent = 'Resetting view';
+      }
+    }
+  }
+
+  private resetStackPool(): void {
+    for (const part of this.stackParts) {
+      if (!part.object.parent) {
+        this.scene.add(part.object);
+      }
+
+      part.object.visible = false;
+      part.object.position.set(part.baseX, part.finalY, part.baseZ);
+      part.object.rotation.set(part.baseRotationX, part.baseRotationY, part.baseRotationZ);
+      part.object.scale.copy(part.baseScale);
+      part.object.updateMatrixWorld(true);
+    }
+
+    this.stackIndex = 0;
+    this.activeDrop = null;
+    this.currentStackTopY = this.stackAnchor.topY;
+    this.landingShakeRemaining = 0;
+  }
+
+  private resetRound = (): void => {
+    this.collapsingBlocks.length = 0;
+    this.awaitingRoundRestart = false;
+    this.resetInProgress = true;
+    this.returningCameraToBase = true;
+    this.resetStackPool();
+
+    if (this.stackButton) {
+      this.stackButton.disabled = true;
+      this.stackButton.textContent = 'Resetting view';
+    }
+    if (this.resetButton) {
+      this.resetButton.disabled = true;
+    }
+    this.setStatus('Resetting round');
+  };
 
   private useImportedCamera(cameras: THREE.Camera[]): void {
     const importedCamera = cameras.find((camera): camera is THREE.PerspectiveCamera => {
@@ -405,6 +620,8 @@ export class MegablocksGame {
 
     this.player.update(delta);
     this.updateStackAnimation(delta);
+    this.updateTowerCollapse(delta);
+    this.updateCameraBaseReturn(delta);
     this.controls.update();
     this.updateCameraHeight(delta);
     this.updateCameraSlider();
@@ -472,6 +689,35 @@ export class MegablocksGame {
 
     this.camera.position.y += amount;
     this.controls.target.y += amount;
+  }
+
+  private updateCameraBaseReturn(delta: number): void {
+    if (!this.returningCameraToBase) {
+      return;
+    }
+
+    const remainingDistance = this.cameraTargetMinY - this.controls.target.y;
+
+    if (Math.abs(remainingDistance) < 0.01) {
+      this.shiftCameraVertically(remainingDistance);
+      this.returningCameraToBase = false;
+
+      if (this.resetInProgress) {
+        this.resetInProgress = false;
+        this.updateStackButton();
+        this.setStatus('Ready for next floor');
+        if (this.resetButton) {
+          this.resetButton.disabled = false;
+        }
+      } else if (this.stackButton && this.awaitingRoundRestart) {
+          this.stackButton.disabled = false;
+          this.stackButton.textContent = 'Start next round';
+      }
+      return;
+    }
+
+    const smoothing = 1 - Math.exp(-delta * CAMERA_BASE_RETURN_SPEED);
+    this.shiftCameraVertically(remainingDistance * smoothing);
   }
 
   private moveCameraFromSlider = (): void => {
