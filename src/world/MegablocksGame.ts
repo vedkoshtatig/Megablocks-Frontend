@@ -7,7 +7,9 @@ import { createPlaceholderBlocks } from './placeholderBlocks';
 const MODEL_URL = '/assets/models/megablocks.glb';
 const HIDDEN_MODEL_OBJECTS = new Set(['Cube_Material_0.001']);
 const ORBIT_TARGET_OBJECT = 'MOVABLE_Ground_Floor';
-const MAX_ORBIT_DISTANCE = 38;
+const MAX_ORBIT_DISTANCE = 40;
+const MIN_ORBIT_POLAR_ANGLE = Math.PI * 0.45;
+
 // Blender X/Y map to Three.js X/Z after GLB's Y-up conversion.
 // Each value is the maximum random distance in either direction.
 const STACK_RANDOM_X_RANGE = 1.4;
@@ -111,6 +113,7 @@ export class MegablocksGame {
   private readonly stackParts: StackPart[] = [];
   private readonly collapseAtBlock = THREE.MathUtils.clamp(COLLAPSE_AT_BLOCK, 1, TOTAL_STACK_BLOCKS);
   private readonly collapsingBlocks: CollapsingBlock[] = [];
+ 
   private activeDrop: ActiveDrop | null = null;
   private stackAnchor: StackAnchor = {
     center: FALLBACK_STACK_ANCHOR.clone(),
@@ -149,6 +152,7 @@ export class MegablocksGame {
     this.controls.enablePan = true;
     this.controls.screenSpacePanning = true;
     this.controls.target.set(0, 1.2, 0);
+    this.controls.minPolarAngle = MIN_ORBIT_POLAR_ANGLE;
     this.controls.maxPolarAngle = Math.PI * 0.48;
     this.controls.maxDistance = MAX_ORBIT_DISTANCE;
 
@@ -269,7 +273,6 @@ export class MegablocksGame {
       }
     });
   }
-
   private focusControlsOnObject(root: THREE.Object3D, objectName: string): void {
     const targetObject = root.getObjectByName(objectName);
 
