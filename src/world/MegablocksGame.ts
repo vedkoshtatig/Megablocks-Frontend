@@ -1,6 +1,15 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { getMegaBlockDataMode } from '../services/megaBlockClient';
+import type {
+  DropMegaBlockResponse,
+  MegaBlockClient,
+  MegaBlockDifficulty,
+  MegaBlockSettings,
+  PlaceMegaBlockBetResponse,
+  UnfinishedMegaBlockBetResponse
+} from '../services/megaBlockTypes';
 import { PlayerController } from './PlayerController';
 import { createPlaceholderBlocks } from './placeholderBlocks';
 
@@ -22,7 +31,6 @@ const CAMERA_VIEW_TOP_LIMIT = 0.72;
 const SLIDER_ORBIT_DEGREES_PER_HEIGHT_UNIT = 9;
 const LANDING_SHAKE_DURATION = 0.28;
 const LANDING_SHAKE_STRENGTH = 0.16;
-const COLLAPSE_AT_BLOCK = 10;
 const COLLAPSE_GRAVITY = 18;
 const BAD_LANDING_TILT_DEGREES = 14;
 const COLLAPSE_CAMERA_FOLLOW_SPEED = 5;
@@ -76,7 +84,9 @@ type ActiveDrop = {
   baseScale: THREE.Vector3;
   elapsed: number;
   hasImpacted: boolean;
+  onSettled: () => void;
   part: StackPart;
+  shouldCollapse: boolean;
   startY: number;
   swingDirection: number;
   swingPhase: number;
@@ -88,6 +98,44 @@ type CollapsingBlock = {
   object: THREE.Object3D;
   startY: number;
   velocity: THREE.Vector3;
+};
+
+type GameStatus = 'idle' | 'placing' | 'active' | 'dropping' | 'cashingOut' | 'won' | 'lost' | 'error';
+
+type MegaBlockUiState = {
+  balance: number | null;
+  betAmount: number;
+  betId: string | null;
+  clientSeed: string;
+  completedFloorCount: number;
+  crashFloor: number | null;
+  currency: string;
+  difficulty: MegaBlockDifficulty;
+  error: string | null;
+  maxFloor: number;
+  nonce: number | null;
+  payoutMultiplier: number;
+  serverSeedHash: string | null;
+  status: GameStatus;
+  winningAmount: number;
+};
+
+const initialMegaBlockState: MegaBlockUiState = {
+  balance: null,
+  betAmount: 0,
+  betId: null,
+  clientSeed: '',
+  completedFloorCount: 0,
+  crashFloor: null,
+  currency: 'SC',
+  difficulty: 'easy',
+  error: null,
+  maxFloor: 24,
+  nonce: null,
+  payoutMultiplier: 1,
+  serverSeedHash: null,
+  status: 'idle',
+  winningAmount: 0
 };
 
 function getModelUrl(): string {
@@ -108,10 +156,17 @@ export class MegablocksGame {
   private readonly statusElement = document.querySelector<HTMLElement>('#status');
   private readonly fpsElement = document.querySelector<HTMLElement>('#fps');
   private readonly stackButton = document.querySelector<HTMLButtonElement>('#stack-next');
+  private readonly placeButton = document.querySelector<HTMLButtonElement>('#place-bet');
+  private readonly cashOutButton = document.querySelector<HTMLButtonElement>('#cash-out');
   private readonly resetButton = document.querySelector<HTMLButtonElement>('#reset-round');
   private readonly cameraHeightElement = document.querySelector<HTMLInputElement>('#camera-height');
+  private readonly amountElement = document.querySelector<HTMLInputElement>('#bet-amount');
+  private readonly difficultyElement = document.querySelector<HTMLSelectElement>('#difficulty');
+  private readonly clientSeedElement = document.querySelector<HTMLInputElement>('#client-seed');
+  private readonly balanceElement = document.querySelector<HTMLElement>('#balance');
+  private readonly roundDetailsElement = document.querySelector<HTMLElement>('#round-details');
+  private readonly dataModeElement = document.querySelector<HTMLElement>('#data-mode');
   private readonly stackParts: StackPart[] = [];
-  private readonly collapseAtBlock = THREE.MathUtils.clamp(COLLAPSE_AT_BLOCK, 1, TOTAL_STACK_BLOCKS);
   private readonly collapsingBlocks: CollapsingBlock[] = [];
  
   private activeDrop: ActiveDrop | null = null;
@@ -131,8 +186,15 @@ export class MegablocksGame {
   private awaitingRoundRestart = false;
   private returningCameraToBase = false;
   private resetInProgress = false;
+  private collapseSettled: (() => void) | null = null;
+  private settings: MegaBlockSettings | null = null;
+  private state: MegaBlockUiState = { ...initialMegaBlockState };
+  private unfinishedGatePending = true;
 
-  constructor(private readonly canvas: HTMLCanvasElement) {
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly client: MegaBlockClient
+  ) {
     this.renderer = new THREE.WebGLRenderer({
       canvas,
       antialias: true,
@@ -159,14 +221,20 @@ export class MegablocksGame {
     this.player = new PlayerController();
 
     this.configureScene();
-    this.stackButton?.addEventListener('click', this.dropNextFloor);
+    this.stackButton?.addEventListener('click', this.dropBlock);
+    this.placeButton?.addEventListener('click', this.placeBet);
+    this.cashOutButton?.addEventListener('click', this.cashOut);
     this.resetButton?.addEventListener('click', this.resetRound);
     this.cameraHeightElement?.addEventListener('input', this.moveCameraFromSlider);
+    this.amountElement?.addEventListener('input', this.updateControls);
+    this.clientSeedElement?.addEventListener('input', this.updateControls);
     window.addEventListener('resize', this.resize);
+    this.updateControls();
   }
 
   async start(): Promise<void> {
     await this.loadWorld();
+    await this.initializeGameSession();
     this.renderer.setAnimationLoop(this.tick);
   }
 
@@ -206,13 +274,131 @@ export class MegablocksGame {
       this.stackAnchor = this.measureStackAnchor(world, ORBIT_TARGET_OBJECT);
       this.currentStackTopY = this.stackAnchor.topY;
       await this.loadStackAssets(loader);
-      this.updateStackButton();
+      this.updateControls();
       this.setStatus(this.stackParts.length ? 'Ready to stack floors' : 'Scene loaded');
     } catch (error) {
       console.warn(`Could not load ${MODEL_URL}. Using placeholder blocks.`, error);
       this.scene.add(createPlaceholderBlocks());
       this.setStatus('Placeholder scene');
     }
+  }
+
+  private async initializeGameSession(): Promise<void> {
+    this.setDataMode();
+
+    try {
+      const launchRequest = this.getLaunchRequest();
+      const launch = await this.client.launch(launchRequest);
+
+      this.state.currency = launch.currency;
+      this.removeCasinoSessionFromUrl();
+
+      this.settings = await this.client.getSettings();
+      this.applySettings(this.settings);
+
+      const hasUnfinishedBet = await this.syncUnfinishedBet({
+        resetStackWhenNone: true,
+        preserveResolvedWhenNone: false
+      });
+
+      if (!hasUnfinishedBet) {
+        this.setStatus('Ready to place bet');
+      }
+    } catch (error) {
+      this.state.status = 'error';
+      this.state.error = getDisplayError(error);
+      this.setStatus(this.state.error);
+    } finally {
+      this.updateControls();
+    }
+  }
+
+  private getLaunchRequest() {
+    const params = new URLSearchParams(window.location.search);
+    const casinoSessionId = params.get('casinoSessionId');
+    const gameKey = params.get('gameKey') ?? 'mega-block';
+    const isMockMode = getMegaBlockDataMode() === 'mock';
+
+    if (gameKey !== 'mega-block') {
+      throw new Error('MegaBlock must launch with gameKey=mega-block.');
+    }
+
+    if (!casinoSessionId && !isMockMode) {
+      throw new Error('Launch URL is missing casinoSessionId.');
+    }
+
+    return {
+      casinoSessionId: casinoSessionId ?? 'mock-casino-session',
+      device: window.innerWidth <= 768 ? 'MOBILE' as const : 'DESKTOP' as const,
+      gameKey: 'mega-block' as const,
+      lang: document.documentElement.lang || 'en'
+    };
+  }
+
+  private removeCasinoSessionFromUrl(): void {
+    const url = new URL(window.location.href);
+
+    if (!url.searchParams.has('casinoSessionId')) {
+      return;
+    }
+
+    url.searchParams.delete('casinoSessionId');
+    window.history.replaceState(window.history.state, document.title, `${url.pathname}${url.search}${url.hash}`);
+  }
+
+  private applySettings(settings: MegaBlockSettings): void {
+    this.state.difficulty = settings.defaultDifficulty;
+    this.state.maxFloor = settings.difficulties[settings.defaultDifficulty].maxFloor;
+
+    if (this.amountElement) {
+      this.amountElement.min = String(settings.minBet);
+      this.amountElement.max = String(settings.maxBet);
+      this.amountElement.value = String(Math.max(settings.minBet, Number(this.amountElement.value) || 1));
+    }
+
+    if (this.difficultyElement) {
+      this.difficultyElement.value = settings.defaultDifficulty;
+    }
+  }
+
+  private restoreUnfinishedBet(response: UnfinishedMegaBlockBetResponse): void {
+    const unfinishedBet = response.unfinishedBet;
+
+    if (!response.hasUnfinishedBet || !unfinishedBet) {
+      this.restoreCompletedStack(0);
+      return;
+    }
+
+    this.state = {
+      ...this.state,
+      betAmount: Number(unfinishedBet.betAmount),
+      betId: unfinishedBet.id,
+      clientSeed: unfinishedBet.clientSeed,
+      completedFloorCount: unfinishedBet.currentFloorCount,
+      crashFloor: null,
+      currency: unfinishedBet.currency,
+      difficulty: unfinishedBet.gameDifficulty,
+      error: null,
+      maxFloor: unfinishedBet.maxFloor,
+      nonce: unfinishedBet.nonce,
+      payoutMultiplier: Number(unfinishedBet.payoutMultiplier),
+      serverSeedHash: unfinishedBet.serverSeedHash,
+      status: 'active',
+      winningAmount: Number(unfinishedBet.winningAmount)
+    };
+
+    if (this.amountElement) {
+      this.amountElement.value = String(Number(unfinishedBet.betAmount));
+    }
+    if (this.difficultyElement) {
+      this.difficultyElement.value = unfinishedBet.gameDifficulty;
+    }
+    if (this.clientSeedElement) {
+      this.clientSeedElement.value = unfinishedBet.clientSeed;
+    }
+
+    this.restoreCompletedStack(unfinishedBet.currentFloorCount);
+    this.setStatus(`Restored round ${unfinishedBet.id}`);
   }
 
   private async loadStackAssets(loader: GLTFLoader): Promise<void> {
@@ -365,54 +551,439 @@ export class MegablocksGame {
     return object.position.y;
   }
 
-  private dropNextFloor = (): void => {
-    if (this.awaitingRoundRestart) {
-      this.awaitingRoundRestart = false;
-      this.updateStackButton();
-      this.setStatus('Ready for next floor');
+  private placeBet = async (): Promise<void> => {
+    if (!this.settings || this.unfinishedGatePending || this.state.status === 'placing' || this.state.betId) {
       return;
     }
 
-    if (this.activeDrop || this.stackIndex >= this.stackParts.length) {
+    const amount = Number(this.amountElement?.value);
+    const difficulty = this.getSelectedDifficulty();
+    const clientSeed = this.clientSeedElement?.value.trim() ?? '';
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      this.showError('Enter a valid bet amount.');
       return;
+    }
+
+    if (clientSeed.length < 1 || clientSeed.length > 32) {
+      this.showError('Client seed must be 1-32 characters.');
+      return;
+    }
+
+    this.state = {
+      ...this.state,
+      betAmount: amount,
+      clientSeed,
+      crashFloor: null,
+      difficulty,
+      error: null,
+      maxFloor: this.settings.difficulties[difficulty].maxFloor,
+      status: 'placing',
+      winningAmount: 0
+    };
+    this.updateControls();
+    this.setStatus('Placing bet');
+
+    try {
+      const bet = await this.client.placeBet({ amount, clientSeed, difficulty });
+      this.applyPlacedBet(bet);
+      this.restoreCompletedStack(0);
+      this.setStatus(`Bet ${bet.betId} placed`);
+    } catch (error) {
+      const errorMessage = getDisplayError(error);
+      this.showError(errorMessage);
+      const hasUnfinishedBet = await this.syncUnfinishedBet({
+        resetStackWhenNone: false,
+        preserveResolvedWhenNone: false
+      });
+      if (!hasUnfinishedBet) {
+        this.showError(errorMessage);
+      }
+    } finally {
+      this.updateControls();
+    }
+  };
+
+  private dropBlock = async (): Promise<void> => {
+    if (this.unfinishedGatePending || !this.state.betId || this.state.status !== 'active' || this.activeDrop) {
+      return;
+    }
+
+    this.state.status = 'dropping';
+    this.state.error = null;
+    this.updateControls();
+    this.setStatus(`Dropping floor ${this.state.completedFloorCount + 1}`);
+
+    try {
+      const response = await this.client.dropBlock(this.state.betId);
+      const shouldCollapse = response.result === 'lost';
+
+      await this.animateNextFloor(shouldCollapse);
+      this.applyDropResponse(response);
+      if (response.result === 'won' || response.result === 'lost') {
+        await this.confirmResolvedRound();
+      }
+    } catch (error) {
+      this.showError(getDisplayError(error));
+      await this.syncUnfinishedBet({
+        resetStackWhenNone: false,
+        preserveResolvedWhenNone: false
+      });
+    } finally {
+      this.updateControls();
+    }
+  };
+
+  private cashOut = async (): Promise<void> => {
+    if (
+      this.unfinishedGatePending ||
+      !this.state.betId ||
+      this.state.status !== 'active' ||
+      this.state.completedFloorCount === 0
+    ) {
+      return;
+    }
+
+    this.state.status = 'cashingOut';
+    this.state.error = null;
+    this.updateControls();
+    this.setStatus('Cashing out');
+
+    try {
+      const response = await this.client.cashOut(this.state.betId);
+      this.state = {
+        ...this.state,
+        balance: response.balance ?? this.state.balance,
+        betId: null,
+        completedFloorCount: response.completedFloorCount,
+        crashFloor: response.crashFloor,
+        maxFloor: response.maxFloor,
+        payoutMultiplier: Number(response.payoutMultiplier),
+        status: 'won',
+        winningAmount: Number(response.winningAmount)
+      };
+      this.setStatus(`Cashed out ${formatAmount(response.winningAmount, response.currency)}`);
+      await this.confirmResolvedRound();
+    } catch (error) {
+      this.showError(getDisplayError(error));
+      await this.syncUnfinishedBet({
+        resetStackWhenNone: false,
+        preserveResolvedWhenNone: false
+      });
+    } finally {
+      this.updateControls();
+    }
+  };
+
+  private animateNextFloor(shouldCollapse: boolean): Promise<void> {
+    if (this.activeDrop || this.stackIndex >= this.stackParts.length || this.stackIndex >= this.state.maxFloor) {
+      return Promise.resolve();
     }
 
     const part = this.stackParts[this.stackIndex];
     const xRange = Math.min(STACK_RANDOM_X_RANGE, this.stackAnchor.halfWidthX);
     const zRange = Math.min(STACK_RANDOM_BLENDER_Y_RANGE, this.stackAnchor.halfWidthZ);
 
-    part.object.visible = true;
-    part.object.position.x = part.baseX + THREE.MathUtils.randFloatSpread(xRange * 2);
-    part.object.position.z = part.baseZ + THREE.MathUtils.randFloatSpread(zRange * 2);
-    part.object.position.y = part.finalY + STACK_DROP_HEIGHT;
-    part.object.rotation.y =
-      part.baseRotationY +
-      THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(STACK_RANDOM_Z_ROTATION_DEGREES * 2));
-    this.currentStackTopY = Math.max(this.currentStackTopY, part.topY);
-    this.activeDrop = {
-      baseRotationX: part.object.rotation.x,
-      baseRotationZ: part.object.rotation.z,
-      baseScale: part.object.scale.clone(),
-      elapsed: 0,
-      hasImpacted: false,
-      part,
-      startY: part.object.position.y,
-      swingDirection: Math.random() < 0.5 ? -1 : 1,
-      swingPhase: Math.random() * Math.PI * 2
-    };
-    this.stackIndex += 1;
-    this.updateStackButton();
-    this.setStatus(`Dropping ${part.label}`);
-  };
+    return new Promise((resolve) => {
+      part.object.visible = true;
+      part.object.position.x = part.baseX + THREE.MathUtils.randFloatSpread(xRange * 2);
+      part.object.position.z = part.baseZ + THREE.MathUtils.randFloatSpread(zRange * 2);
+      part.object.position.y = part.finalY + STACK_DROP_HEIGHT;
+      part.object.rotation.y =
+        part.baseRotationY +
+        THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(STACK_RANDOM_Z_ROTATION_DEGREES * 2));
+      this.currentStackTopY = Math.max(this.currentStackTopY, part.topY);
+      this.activeDrop = {
+        baseRotationX: part.object.rotation.x,
+        baseRotationZ: part.object.rotation.z,
+        baseScale: part.object.scale.clone(),
+        elapsed: 0,
+        hasImpacted: false,
+        onSettled: resolve,
+        part,
+        shouldCollapse,
+        startY: part.object.position.y,
+        swingDirection: Math.random() < 0.5 ? -1 : 1,
+        swingPhase: Math.random() * Math.PI * 2
+      };
+      this.stackIndex += 1;
+      this.updateControls();
+      this.setStatus(`Dropping ${part.label}`);
+    });
+  }
 
   private updateStackButton(): void {
-    if (!this.stackButton) {
+    this.updateControls();
+  }
+
+  private applyPlacedBet(bet: PlaceMegaBlockBetResponse): void {
+    this.state = {
+      ...this.state,
+      betAmount: Number(bet.betAmount),
+      betId: bet.betId,
+      clientSeed: bet.clientSeed,
+      completedFloorCount: bet.currentFloorCount,
+      crashFloor: null,
+      currency: bet.currency,
+      difficulty: bet.difficulty,
+      error: null,
+      maxFloor: bet.maxFloor,
+      nonce: bet.nonce,
+      payoutMultiplier: 1,
+      serverSeedHash: bet.serverSeedHash,
+      status: 'active',
+      winningAmount: 0
+    };
+  }
+
+  private applyDropResponse(response: DropMegaBlockResponse): void {
+    if (response.result === 'lost') {
+      this.state = {
+        ...this.state,
+        betId: null,
+        completedFloorCount: response.completedFloorCount,
+        crashFloor: response.crashFloor ?? response.attemptedFloor ?? null,
+        maxFloor: response.maxFloor,
+        payoutMultiplier: Number(response.payoutMultiplier),
+        status: 'lost',
+        winningAmount: Number(response.winningAmount ?? 0)
+      };
+      this.restoreCompletedStack(response.completedFloorCount);
+      this.setStatus(`Crashed on floor ${response.attemptedFloor ?? response.crashFloor ?? '?'}`);
       return;
     }
 
-    const nextPart = this.stackParts[this.stackIndex];
-    this.stackButton.disabled = Boolean(this.activeDrop) || !nextPart;
-    this.stackButton.textContent = nextPart ? `Drop ${nextPart.label}` : 'Stack complete';
+    if (response.result === 'won') {
+      this.state = {
+        ...this.state,
+        balance: response.balance ?? this.state.balance,
+        betId: null,
+        completedFloorCount: response.completedFloorCount,
+        crashFloor: response.crashFloor ?? null,
+        maxFloor: response.maxFloor,
+        payoutMultiplier: Number(response.payoutMultiplier),
+        status: 'won',
+        winningAmount: Number(response.winningAmount ?? 0)
+      };
+      this.setStatus(`Auto won ${formatAmount(this.state.winningAmount, this.state.currency)}`);
+      return;
+    }
+
+    this.state = {
+      ...this.state,
+      completedFloorCount: response.completedFloorCount,
+      maxFloor: response.maxFloor,
+      payoutMultiplier: Number(response.payoutMultiplier),
+      status: 'active'
+    };
+    this.setStatus(`Floor ${response.completedFloorCount} safe`);
+  }
+
+  private restoreCompletedStack(completedFloorCount: number): void {
+    this.resetStackPool();
+    const visibleCount = THREE.MathUtils.clamp(
+      completedFloorCount,
+      0,
+      Math.min(this.state.maxFloor, this.stackParts.length)
+    );
+
+    for (let index = 0; index < visibleCount; index += 1) {
+      const part = this.stackParts[index];
+      part.object.visible = true;
+      part.object.position.set(part.baseX, part.finalY, part.baseZ);
+      part.object.rotation.set(part.baseRotationX, part.baseRotationY, part.baseRotationZ);
+      part.object.scale.copy(part.baseScale);
+      this.currentStackTopY = Math.max(this.currentStackTopY, part.topY);
+    }
+
+    this.stackIndex = visibleCount;
+    this.updateControls();
+  }
+
+  private async syncUnfinishedBet(options: {
+    preserveResolvedWhenNone: boolean;
+    resetStackWhenNone: boolean;
+  }): Promise<boolean> {
+    this.unfinishedGatePending = true;
+    this.updateControls();
+
+    try {
+      const unfinishedBet = await this.client.getUnfinishedBet();
+
+      if (unfinishedBet.hasUnfinishedBet) {
+        this.restoreUnfinishedBet(unfinishedBet);
+        this.unfinishedGatePending = false;
+        return true;
+      }
+
+      if (options.resetStackWhenNone) {
+        this.restoreCompletedStack(0);
+      }
+
+      this.state = {
+        ...this.state,
+        betId: null,
+        completedFloorCount: options.preserveResolvedWhenNone ? this.state.completedFloorCount : 0,
+        crashFloor: options.preserveResolvedWhenNone ? this.state.crashFloor : null,
+        error: options.preserveResolvedWhenNone ? this.state.error : null,
+        payoutMultiplier: options.preserveResolvedWhenNone ? this.state.payoutMultiplier : 1,
+        status: options.preserveResolvedWhenNone ? this.state.status : 'idle',
+        winningAmount: options.preserveResolvedWhenNone ? this.state.winningAmount : 0
+      };
+      this.unfinishedGatePending = false;
+      return false;
+    } catch (error) {
+      this.state.error = getDisplayError(error);
+      this.setStatus(this.state.error);
+      return true;
+    } finally {
+      this.updateControls();
+    }
+  }
+
+  private async confirmResolvedRound(): Promise<void> {
+    const statusBeforeConfirmation = this.state.status;
+    const statusText = this.statusElement?.textContent ?? '';
+
+    await this.syncUnfinishedBet({
+      resetStackWhenNone: false,
+      preserveResolvedWhenNone: true
+    });
+
+    if (!this.state.betId && (statusBeforeConfirmation === 'won' || statusBeforeConfirmation === 'lost')) {
+      this.state.status = statusBeforeConfirmation;
+      this.setStatus(statusText);
+    }
+  }
+
+  private updateControls = (): void => {
+    const hasActiveBet = Boolean(this.state.betId);
+    const isResolvedRound =
+      !hasActiveBet && (this.state.status === 'won' || this.state.status === 'lost');
+    const isBusy =
+      this.state.status === 'placing' ||
+      this.state.status === 'dropping' ||
+      this.state.status === 'cashingOut' ||
+      this.unfinishedGatePending ||
+      Boolean(this.activeDrop) ||
+      this.collapsingBlocks.length > 0;
+    const canPlace = Boolean(this.settings) && !hasActiveBet && !isBusy && this.state.status !== 'error';
+    const canDrop =
+      hasActiveBet &&
+      this.state.status === 'active' &&
+      !isBusy &&
+      this.stackIndex < this.state.maxFloor &&
+      this.stackIndex < this.stackParts.length;
+    const canCashOut =
+      hasActiveBet &&
+      this.state.status === 'active' &&
+      this.state.completedFloorCount > 0 &&
+      !isBusy;
+
+    if (this.placeButton) {
+      this.placeButton.disabled = !canPlace;
+      this.placeButton.textContent = this.state.status === 'placing' ? 'Placing' : 'Place Bet';
+    }
+
+    if (this.stackButton) {
+      this.stackButton.disabled = !canDrop;
+      this.stackButton.textContent =
+        this.state.status === 'dropping'
+          ? 'Dropping'
+          : canDrop
+            ? `Drop Floor ${this.stackIndex + 1}`
+            : 'Drop Block';
+    }
+
+    if (this.cashOutButton) {
+      this.cashOutButton.disabled = !canCashOut;
+      this.cashOutButton.textContent =
+        this.state.status === 'cashingOut'
+          ? 'Cashing Out'
+          : hasActiveBet && this.state.completedFloorCount
+            ? `Cash Out ${this.state.payoutMultiplier.toFixed(3)}x`
+            : 'Cash Out';
+    }
+
+    if (this.resetButton) {
+      this.resetButton.disabled = this.returningCameraToBase && !isResolvedRound;
+    }
+
+    if (this.amountElement) {
+      this.amountElement.disabled = hasActiveBet || isBusy;
+    }
+
+    if (this.difficultyElement) {
+      this.difficultyElement.disabled = hasActiveBet || isBusy;
+    }
+
+    if (this.clientSeedElement) {
+      this.clientSeedElement.disabled = hasActiveBet || isBusy;
+    }
+
+    if (this.balanceElement) {
+      this.balanceElement.textContent =
+        this.state.balance === null
+          ? `-- ${this.state.currency}`
+          : formatAmount(this.state.balance, this.state.currency);
+    }
+
+    if (this.roundDetailsElement) {
+      this.roundDetailsElement.textContent = this.getRoundDetailsText();
+    }
+  };
+
+  private getRoundDetailsText(): string {
+    if (this.state.error) {
+      return this.state.error;
+    }
+
+    if (!this.state.betId && this.state.status !== 'won' && this.state.status !== 'lost') {
+      return `Limits ${this.settings?.minBet ?? 0.1}-${this.settings?.maxBet ?? 100} ${this.state.currency}`;
+    }
+
+    const floorText = `${this.state.completedFloorCount}/${this.state.maxFloor} floors`;
+
+    if (this.state.status === 'lost') {
+      return `${floorText} | Lost on floor ${this.state.crashFloor ?? '?'} | ${this.state.currency}`;
+    }
+
+    if (this.state.status === 'won') {
+      return `${floorText} | Won ${formatAmount(this.state.winningAmount, this.state.currency)}`;
+    }
+
+    return `${floorText} | ${this.state.payoutMultiplier.toFixed(3)}x | Bet ${formatAmount(
+      this.state.betAmount,
+      this.state.currency
+    )}`;
+  }
+
+  private getSelectedDifficulty(): MegaBlockDifficulty {
+    const value = this.difficultyElement?.value;
+
+    if (value === 'medium' || value === 'hard' || value === 'hardcore') {
+      return value;
+    }
+
+    return 'easy';
+  }
+
+  private showError(message: string): void {
+    this.state = {
+      ...this.state,
+      error: message,
+      status: this.state.betId ? 'active' : 'idle'
+    };
+    this.setStatus(message);
+    this.updateControls();
+  }
+
+  private setDataMode(): void {
+    if (!this.dataModeElement) {
+      return;
+    }
+
+    this.dataModeElement.textContent = getMegaBlockDataMode() === 'mock' ? 'Mock data' : 'API data';
   }
 
   private updateStackAnimation(delta: number): void {
@@ -462,15 +1033,17 @@ export class MegablocksGame {
       drop.part.object.scale.copy(drop.baseScale);
       this.activeDrop = null;
 
-      if (this.stackIndex === this.collapseAtBlock) {
+      if (drop.shouldCollapse) {
         drop.part.object.rotation.z += THREE.MathUtils.degToRad(
           BAD_LANDING_TILT_DEGREES * (Math.random() < 0.5 ? -1 : 1)
         );
+        this.collapseSettled = drop.onSettled;
         this.startTowerCollapse();
         return;
       }
 
-      this.updateStackButton();
+      drop.onSettled();
+      this.updateControls();
       this.setStatus(this.stackIndex >= this.stackParts.length ? 'Building stacked' : 'Ready for next floor');
     }
   }
@@ -505,7 +1078,7 @@ export class MegablocksGame {
       this.stackButton.disabled = true;
       this.stackButton.textContent = 'Tower collapsing';
     }
-    this.setStatus(`Block ${this.collapseAtBlock} landed badly!`);
+    this.setStatus(`Floor ${this.stackIndex} landed badly!`);
   }
 
   private updateTowerCollapse(delta: number): void {
@@ -556,12 +1129,14 @@ export class MegablocksGame {
       this.collapsingBlocks.length = 0;
       this.returningCameraToBase = true;
       this.resetStackPool();
-      this.awaitingRoundRestart = true;
+      this.awaitingRoundRestart = false;
       this.setStatus('Tower collapsed');
       if (this.stackButton) {
         this.stackButton.disabled = true;
         this.stackButton.textContent = 'Resetting view';
       }
+      this.collapseSettled?.();
+      this.collapseSettled = null;
     }
   }
 
@@ -589,7 +1164,7 @@ export class MegablocksGame {
     this.awaitingRoundRestart = false;
     this.resetInProgress = true;
     this.returningCameraToBase = true;
-    this.resetStackPool();
+    this.restoreCompletedStack(this.state.completedFloorCount);
 
     if (this.stackButton) {
       this.stackButton.disabled = true;
@@ -707,14 +1282,13 @@ export class MegablocksGame {
 
       if (this.resetInProgress) {
         this.resetInProgress = false;
-        this.updateStackButton();
+        this.updateControls();
         this.setStatus('Ready for next floor');
         if (this.resetButton) {
           this.resetButton.disabled = false;
         }
       } else if (this.stackButton && this.awaitingRoundRestart) {
-          this.stackButton.disabled = false;
-          this.stackButton.textContent = 'Start next round';
+        this.updateControls();
       }
       return;
     }
@@ -784,4 +1358,12 @@ export class MegablocksGame {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
   };
+}
+
+function formatAmount(value: number | string, currency: string): string {
+  return `${Number(value).toFixed(2)} ${currency}`;
+}
+
+function getDisplayError(error: unknown): string {
+  return error instanceof Error ? error.message : 'MegaBlock request failed.';
 }

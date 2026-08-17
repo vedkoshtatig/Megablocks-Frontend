@@ -11,6 +11,8 @@
     <div class="hud" aria-label="Game HUD">
       <div class="hud__brand">Megablocks 3D</div>
       <div class="hud__stats">
+        <span id="data-mode">Mock data</span>
+        <span id="balance">-- SC</span>
         <span id="fps">-- fps</span>
         <span id="status">Loading scene</span>
       </div>
@@ -28,8 +30,28 @@
       <span aria-hidden="true">↓</span>
     </div>
     <div class="control-panel" aria-label="Game controls">
-      <button class="reset-button" id="reset-round" type="button">Reset</button>
-      <button class="stack-button" id="stack-next" type="button" disabled>Drop next floor</button>
+      <label class="field">
+        <span>Bet</span>
+        <input id="bet-amount" type="number" min="0.1" max="100" step="0.01" value="1" />
+      </label>
+      <label class="field">
+        <span>Risk</span>
+        <select id="difficulty">
+          <option value="easy">Easy</option>
+          <option value="medium">Medium</option>
+          <option value="hard">Hard</option>
+          <option value="hardcore">Hardcore</option>
+        </select>
+      </label>
+      <label class="field field--seed">
+        <span>Seed</span>
+        <input id="client-seed" maxlength="32" value="local-seed" />
+      </label>
+      <button class="reset-button" id="reset-round" type="button">Reset View</button>
+      <button class="place-button" id="place-bet" type="button" disabled>Place Bet</button>
+      <button class="stack-button" id="stack-next" type="button" disabled>Drop Block</button>
+      <button class="cashout-button" id="cash-out" type="button" disabled>Cash Out</button>
+      <div class="round-details" id="round-details">No active round</div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
