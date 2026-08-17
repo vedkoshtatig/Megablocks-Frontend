@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { MegaBlockApiError } from '../services/megaBlockApi';
+import { appEnv } from '../config/env';
 import { getMegaBlockDataMode } from '../services/megaBlockClient';
 import type {
   DropMegaBlockResponse,
@@ -26,7 +27,7 @@ const STACK_RANDOM_X_RANGE = 1.4;
 const STACK_RANDOM_BLENDER_Y_RANGE = 1.4;
 // Blender Z rotation maps to Three.js Y rotation after export.
 const STACK_RANDOM_Z_ROTATION_DEGREES = 12;
-const TOTAL_STACK_BLOCKS = 25;
+const TOTAL_STACK_BLOCKS = 24;
 const CAMERA_TOP_PADDING = 3;
 const CAMERA_VIEW_TOP_LIMIT = 0.72;
 const SLIDER_ORBIT_DEGREES_PER_HEIGHT_UNIT = 9;
@@ -156,8 +157,7 @@ export class MegablocksGame {
   private readonly player: PlayerController;
   private readonly statusElement = document.querySelector<HTMLElement>('#status');
   private readonly fpsElement = document.querySelector<HTMLElement>('#fps');
-  private readonly stackButton = document.querySelector<HTMLButtonElement>('#stack-next');
-  private readonly placeButton = document.querySelector<HTMLButtonElement>('#place-bet');
+  private readonly stackButton = document.querySelector<HTMLButtonElement>('#primary-action');
   private readonly cashOutButton = document.querySelector<HTMLButtonElement>('#cash-out');
   private readonly resetButton = document.querySelector<HTMLButtonElement>('#reset-round');
   private readonly cameraHeightElement = document.querySelector<HTMLInputElement>('#camera-height');
@@ -222,8 +222,7 @@ export class MegablocksGame {
     this.player = new PlayerController();
 
     this.configureScene();
-    this.stackButton?.addEventListener('click', this.dropBlock);
-    this.placeButton?.addEventListener('click', this.placeBet);
+    this.stackButton?.addEventListener('click', this.handlePrimaryAction);
     this.cashOutButton?.addEventListener('click', this.cashOut);
     this.resetButton?.addEventListener('click', this.resetRound);
     this.cameraHeightElement?.addEventListener('input', this.moveCameraFromSlider);
@@ -234,9 +233,18 @@ export class MegablocksGame {
   }
 
   async start(): Promise<void> {
-    await this.loadWorld();
-    await this.initializeGameSession();
     this.renderer.setAnimationLoop(this.tick);
+
+    await Promise.all([
+      this.loadWorld(),
+      this.initializeGameSession()
+    ]);
+
+    // Session restoration can finish before the large scene assets load.
+    // Reapply the visual stack once both sides are ready.
+    if (this.state.betId && this.state.completedFloorCount > 0) {
+      this.restoreCompletedStack(this.state.completedFloorCount);
+    }
   }
 
   private configureScene(): void {
@@ -319,17 +327,18 @@ export class MegablocksGame {
     const casinoSessionId = params.get('casinoSessionId');
     const gameKey = params.get('gameKey') ?? 'mega-block';
     const isMockMode = getMegaBlockDataMode() === 'mock';
+    const effectiveSessionId = casinoSessionId ?? appEnv.a1StubSessionId;
 
     if (gameKey !== 'mega-block') {
       throw new Error('MegaBlock must launch with gameKey=mega-block.');
     }
 
-    if (!casinoSessionId && !isMockMode) {
-      throw new Error('Launch URL is missing casinoSessionId.');
+    if (!effectiveSessionId && !isMockMode) {
+      throw new Error('Launch URL is missing casinoSessionId and no development stub session is configured.');
     }
 
     return {
-      casinoSessionId: casinoSessionId ?? 'mock-casino-session',
+      casinoSessionId: effectiveSessionId ?? 'mock-casino-session',
       device: window.innerWidth <= 768 ? 'MOBILE' as const : 'DESKTOP' as const,
       gameKey: 'mega-block' as const,
       lang: document.documentElement.lang || 'en'
@@ -642,6 +651,15 @@ export class MegablocksGame {
     }
   };
 
+  private handlePrimaryAction = (): void => {
+    if (this.state.betId) {
+      void this.dropBlock();
+      return;
+    }
+
+    void this.placeBet();
+  };
+
   private dropBlock = async (): Promise<void> => {
     if (this.unfinishedGatePending || !this.state.betId || this.state.status !== 'active' || this.activeDrop) {
       return;
@@ -650,7 +668,7 @@ export class MegablocksGame {
     this.state.status = 'dropping';
     this.state.error = null;
     this.updateControls();
-    this.setStatus(`Dropping floor ${this.state.completedFloorCount + 1}`);
+    this.setStatus('Block in motion');
 
     try {
       const response = await this.client.dropBlock(this.state.betId);
@@ -705,6 +723,8 @@ export class MegablocksGame {
         status: 'won',
         winningAmount: Number(response.winningAmount)
       };
+      this.resetStackPool();
+      this.returningCameraToBase = true;
       this.setStatus(`Cashed out ${formatAmount(response.winningAmount, response.currency)}`);
       await this.confirmResolvedRound();
     } catch (error) {
@@ -756,7 +776,7 @@ export class MegablocksGame {
       };
       this.stackIndex += 1;
       this.updateControls();
-      this.setStatus(`Dropping ${part.label}`);
+      this.setStatus('Block in motion');
     });
   }
 
@@ -796,7 +816,6 @@ export class MegablocksGame {
         status: 'lost',
         winningAmount: Number(response.winningAmount ?? 0)
       };
-      this.restoreCompletedStack(response.completedFloorCount);
       this.setStatus(`Crashed on floor ${response.attemptedFloor ?? response.crashFloor ?? '?'}`);
       return;
     }
@@ -938,29 +957,30 @@ export class MegablocksGame {
       this.state.completedFloorCount > 0 &&
       !isBusy;
 
-    if (this.placeButton) {
-      this.placeButton.disabled = !canPlace;
-      this.placeButton.textContent = this.state.status === 'placing' ? 'Placing' : 'Place Bet';
-    }
-
     if (this.stackButton) {
-      this.stackButton.disabled = !canDrop;
-      this.stackButton.textContent =
-        this.state.status === 'dropping'
-          ? 'Dropping'
-          : canDrop
-            ? `Drop Floor ${this.stackIndex + 1}`
-            : 'Drop Block';
+      this.stackButton.disabled = hasActiveBet ? !canDrop : !canPlace;
+      const isDropAction =
+        hasActiveBet && (this.state.status === 'active' || this.state.status === 'dropping');
+      this.stackButton.textContent = isDropAction ? 'Go' : 'Play';
     }
 
     if (this.cashOutButton) {
       this.cashOutButton.disabled = !canCashOut;
-      this.cashOutButton.textContent =
-        this.state.status === 'cashingOut'
-          ? 'Cashing Out'
-          : hasActiveBet && this.state.completedFloorCount
-            ? `Cash Out ${this.state.payoutMultiplier.toFixed(3)}x`
-            : 'Cash Out';
+      const cashOutAmount = this.state.betAmount * this.state.payoutMultiplier;
+
+      if (this.state.status === 'cashingOut') {
+        this.cashOutButton.textContent = 'Cashing Out';
+      } else if (hasActiveBet && this.state.completedFloorCount) {
+        const amount = document.createElement('span');
+        amount.className = 'cashout-button__amount';
+        amount.textContent = formatPanelAmount(cashOutAmount, this.state.currency);
+        const multiplier = document.createElement('span');
+        multiplier.className = 'cashout-button__multiplier';
+        multiplier.textContent = `(${this.state.payoutMultiplier.toFixed(3)}x)`;
+        this.cashOutButton.replaceChildren(document.createTextNode('Cash Out'), amount, multiplier);
+      } else {
+        this.cashOutButton.textContent = 'Cash Out';
+      }
     }
 
     if (this.resetButton) {
@@ -982,13 +1002,14 @@ export class MegablocksGame {
     if (this.balanceElement) {
       this.balanceElement.textContent =
         this.state.balance === null
-          ? `-- ${this.state.currency}`
-          : formatAmount(this.state.balance, this.state.currency);
+          ? `${this.state.currency} --`
+          : formatPanelAmount(this.state.balance, this.state.currency);
     }
 
     if (this.roundDetailsElement) {
       this.roundDetailsElement.textContent = this.getRoundDetailsText();
     }
+
   };
 
   private getRoundDetailsText(): string {
@@ -1143,7 +1164,6 @@ export class MegablocksGame {
 
     if (this.stackButton) {
       this.stackButton.disabled = true;
-      this.stackButton.textContent = 'Tower collapsing';
     }
     this.setStatus(`Floor ${this.stackIndex} landed badly!`);
   }
@@ -1429,6 +1449,10 @@ export class MegablocksGame {
 
 function formatAmount(value: number | string, currency: string): string {
   return `${Number(value).toFixed(2)} ${currency}`;
+}
+
+function formatPanelAmount(value: number | string, currency: string): string {
+  return `${currency} ${Number(value).toFixed(2)}`;
 }
 
 function hasAtMostTwoDecimalPlaces(value: string): boolean {

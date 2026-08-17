@@ -22,6 +22,18 @@ game exchanges `casinoSessionId` for an original-games token, removes `casinoSes
 from the URL, loads settings, and blocks new-bet controls until `unfinished-bet` has been
 checked.
 
+For local API development, `.env.local` may provide a stub A1 session so the URL does
+not need query parameters:
+
+```env
+VITE_USE_MOCK_DATA=false
+NEXT_PUBLIC_BASE_URL=http://localhost:9004
+VITE_A1_STUB_SESSION_ID=a1-mock-megablock-sc
+```
+
+`VITE_A1_STUB_SESSION_ID` is read only by Vite's development mode. Production API mode
+still requires the operator-issued `casinoSessionId` in the launch URL.
+
 To run without the backend, opt into the local mock client:
 
 ```bash

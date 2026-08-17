@@ -18,6 +18,9 @@ function readBooleanEnv(name: string, fallback: boolean): boolean {
 }
 
 export const appEnv = {
+  a1StubSessionId: env.DEV
+    ? readEnv('VITE_A1_STUB_SESSION_ID')
+    : undefined,
   apiBaseUrl:
     readEnv('VITE_BASE_URL') ??
     readEnv('VITE_ORIGINAL_GAMES_BASE_URL') ??
