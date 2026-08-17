@@ -113,6 +113,11 @@ body {
   opacity: 0.64;
 }
 
+.field input.field__input--error {
+  border-color: rgba(248, 113, 113, 0.95);
+  box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.28);
+}
+
 .field--seed {
   min-width: 150px;
 }

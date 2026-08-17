@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { MegaBlockApiError } from '../services/megaBlockApi';
 import { getMegaBlockDataMode } from '../services/megaBlockClient';
 import type {
   DropMegaBlockResponse,
@@ -226,7 +227,7 @@ export class MegablocksGame {
     this.cashOutButton?.addEventListener('click', this.cashOut);
     this.resetButton?.addEventListener('click', this.resetRound);
     this.cameraHeightElement?.addEventListener('input', this.moveCameraFromSlider);
-    this.amountElement?.addEventListener('input', this.updateControls);
+    this.amountElement?.addEventListener('input', this.handleAmountInput);
     this.clientSeedElement?.addEventListener('input', this.updateControls);
     window.addEventListener('resize', this.resize);
     this.updateControls();
@@ -556,12 +557,31 @@ export class MegablocksGame {
       return;
     }
 
-    const amount = Number(this.amountElement?.value);
+    const amountInput = this.amountElement?.value.trim() ?? '';
+    const amount = Number(amountInput);
     const difficulty = this.getSelectedDifficulty();
     const clientSeed = this.clientSeedElement?.value.trim() ?? '';
 
     if (!Number.isFinite(amount) || amount <= 0) {
+      this.highlightAmountInput();
       this.showError('Enter a valid bet amount.');
+      return;
+    }
+
+    if (!hasAtMostTwoDecimalPlaces(amountInput)) {
+      this.highlightAmountInput();
+      this.showError('Bet amount can use at most two decimal places.');
+      return;
+    }
+
+    if (amount < this.settings.minBet || amount > this.settings.maxBet) {
+      this.highlightAmountInput();
+      this.showError(
+        `Bet amount must be ${formatAmount(this.settings.minBet, this.state.currency)}-${formatAmount(
+          this.settings.maxBet,
+          this.state.currency
+        )}.`
+      );
       return;
     }
 
@@ -590,14 +610,32 @@ export class MegablocksGame {
       this.restoreCompletedStack(0);
       this.setStatus(`Bet ${bet.betId} placed`);
     } catch (error) {
-      const errorMessage = getDisplayError(error);
-      this.showError(errorMessage);
+      const backendErrorType = getBackendErrorType(error);
+
+      if (backendErrorType === 'BetAmountOutOfRangeErrorType') {
+        this.highlightAmountInput();
+        await this.refreshSettings();
+      }
+
+      if (backendErrorType === 'OpenBetExistsErrorType') {
+        this.setStatus('Restoring open round');
+        const restoredRound = await this.syncUnfinishedBet({
+          resetStackWhenNone: false,
+          preserveResolvedWhenNone: false
+        });
+
+        if (!restoredRound) {
+          this.showError('Open round exists, but it could not be restored.');
+        }
+        return;
+      }
+
       const hasUnfinishedBet = await this.syncUnfinishedBet({
         resetStackWhenNone: false,
         preserveResolvedWhenNone: false
       });
       if (!hasUnfinishedBet) {
-        this.showError(errorMessage);
+        this.showError(getDisplayError(error));
       }
     } finally {
       this.updateControls();
@@ -624,11 +662,16 @@ export class MegablocksGame {
         await this.confirmResolvedRound();
       }
     } catch (error) {
-      this.showError(getDisplayError(error));
-      await this.syncUnfinishedBet({
+      const hasUnfinishedBet = await this.syncUnfinishedBet({
         resetStackWhenNone: false,
         preserveResolvedWhenNone: false
       });
+
+      if (hasUnfinishedBet) {
+        this.showError(getDisplayError(error));
+      } else if (getBackendErrorType(error) !== 'NoOpenBetErrorType') {
+        this.showError(getDisplayError(error));
+      }
     } finally {
       this.updateControls();
     }
@@ -665,11 +708,16 @@ export class MegablocksGame {
       this.setStatus(`Cashed out ${formatAmount(response.winningAmount, response.currency)}`);
       await this.confirmResolvedRound();
     } catch (error) {
-      this.showError(getDisplayError(error));
-      await this.syncUnfinishedBet({
+      const hasUnfinishedBet = await this.syncUnfinishedBet({
         resetStackWhenNone: false,
         preserveResolvedWhenNone: false
       });
+
+      if (hasUnfinishedBet) {
+        this.showError(getDisplayError(error));
+      } else if (getBackendErrorType(error) !== 'NoOpenBetErrorType') {
+        this.showError(getDisplayError(error));
+      }
     } finally {
       this.updateControls();
     }
@@ -841,6 +889,16 @@ export class MegablocksGame {
     }
   }
 
+  private async refreshSettings(): Promise<void> {
+    try {
+      this.settings = await this.client.getSettings();
+      this.applySettings(this.settings);
+    } catch (error) {
+      this.state.error = getDisplayError(error);
+      this.setStatus(this.state.error);
+    }
+  }
+
   private async confirmResolvedRound(): Promise<void> {
     const statusBeforeConfirmation = this.state.status;
     const statusText = this.statusElement?.textContent ?? '';
@@ -976,6 +1034,15 @@ export class MegablocksGame {
     };
     this.setStatus(message);
     this.updateControls();
+  }
+
+  private handleAmountInput = (): void => {
+    this.amountElement?.classList.remove('field__input--error');
+    this.updateControls();
+  };
+
+  private highlightAmountInput(): void {
+    this.amountElement?.classList.add('field__input--error');
   }
 
   private setDataMode(): void {
@@ -1362,6 +1429,34 @@ export class MegablocksGame {
 
 function formatAmount(value: number | string, currency: string): string {
   return `${Number(value).toFixed(2)} ${currency}`;
+}
+
+function hasAtMostTwoDecimalPlaces(value: string): boolean {
+  return /^\d+(\.\d{1,2})?$/.test(value);
+}
+
+function getBackendErrorType(error: unknown): string | null {
+  if (error instanceof MegaBlockApiError) {
+    return error.backendErrorType;
+  }
+
+  if (!(error instanceof Error)) {
+    return null;
+  }
+
+  const backendErrorTypes = [
+    'OperatorSessionInvalidErrorType',
+    'OriginalGameNotFoundErrorType',
+    'OriginalGameNotAvailableErrorType',
+    'BetAmountOutOfRangeErrorType',
+    'InsufficientBalanceErrorType',
+    'OpenBetExistsErrorType',
+    'NoOpenBetErrorType',
+    'MegaBlockNoFloorsCompletedErrorType',
+    'WalletServiceUnavailableErrorType'
+  ];
+
+  return backendErrorTypes.find((errorType) => error.message.includes(errorType)) ?? null;
 }
 
 function getDisplayError(error: unknown): string {

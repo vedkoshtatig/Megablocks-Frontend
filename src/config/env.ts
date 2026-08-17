@@ -23,5 +23,5 @@ export const appEnv = {
     readEnv('VITE_ORIGINAL_GAMES_BASE_URL') ??
     readEnv('NEXT_PUBLIC_BASE_URL') ??
     'http://localhost:9004',
-  useMockData: readBooleanEnv('VITE_USE_MOCK_DATA', true)
+  useMockData: readBooleanEnv('VITE_USE_MOCK_DATA', false)
 };

@@ -14,8 +14,34 @@ import type {
 
 type ApiEnvelope<T> = {
   data: T;
-  errors?: Array<{ errorCode?: number; fields?: Record<string, unknown>; message?: string }>;
+  errors?: ApiErrorPayload[];
 };
+
+type ApiErrorPayload = {
+  errorCode?: number | string;
+  fields?: Record<string, unknown>;
+  message?: string;
+  name?: string;
+  type?: string;
+};
+
+export class MegaBlockApiError extends Error {
+  readonly backendErrorType: string | null;
+  readonly errorCode: number | string | null;
+  readonly fields: Record<string, unknown>;
+  readonly status: number;
+
+  constructor(status: number, payload?: ApiErrorPayload) {
+    const backendErrorType = getBackendErrorType(payload);
+    const errorCode = payload?.errorCode ?? null;
+    super(getApiErrorMessage(payload, backendErrorType, errorCode));
+    this.name = 'MegaBlockApiError';
+    this.backendErrorType = backendErrorType;
+    this.errorCode = errorCode;
+    this.fields = payload?.fields ?? {};
+    this.status = status;
+  }
+}
 
 export class MegaBlockApiClient implements MegaBlockClient {
   private token: string | null = null;
@@ -105,10 +131,47 @@ export class MegaBlockApiClient implements MegaBlockClient {
     }
 
     if (!response.ok || (envelope.errors?.length ?? 0) > 0) {
-      const errorCode = envelope.errors?.[0]?.errorCode;
-      throw new Error(errorCode ? `MegaBlock API error ${errorCode}` : 'MegaBlock API request failed.');
+      throw new MegaBlockApiError(response.status, envelope.errors?.[0]);
     }
 
     return envelope.data;
   }
+}
+
+function getApiErrorMessage(
+  payload: ApiErrorPayload | undefined,
+  backendErrorType: string | null,
+  errorCode: number | string | null
+): string {
+  if (backendErrorType) {
+    return backendErrorType;
+  }
+
+  if (payload?.message) {
+    return payload.message;
+  }
+
+  return errorCode ? `MegaBlock API error ${errorCode}` : 'MegaBlock API request failed.';
+}
+
+function getBackendErrorType(payload: ApiErrorPayload | undefined): string | null {
+  const fields = payload?.fields;
+  const candidates = [
+    payload?.type,
+    payload?.name,
+    fields?.errorType,
+    fields?.type,
+    fields?.name,
+    fields?.error,
+    fields?.code,
+    payload?.message
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.endsWith('ErrorType')) {
+      return candidate;
+    }
+  }
+
+  return null;
 }

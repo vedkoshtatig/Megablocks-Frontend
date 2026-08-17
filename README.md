@@ -10,7 +10,25 @@ npm run export:blend
 npm run dev
 ```
 
-Open the Vite URL shown in the terminal. The game tries to load:
+By default the frontend talks to the original-games backend at `http://localhost:9004` and
+expects the MegaBlock launch contract. Open:
+
+```text
+http://localhost:9010/original-games/megablock?casinoSessionId=a1-mock-megablock-sc&gameKey=mega-block
+```
+
+If Vite starts on a different port, keep the same path and query on that local origin. The
+game exchanges `casinoSessionId` for an original-games token, removes `casinoSessionId`
+from the URL, loads settings, and blocks new-bet controls until `unfinished-bet` has been
+checked.
+
+To run without the backend, opt into the local mock client:
+
+```bash
+VITE_USE_MOCK_DATA=true npm run dev
+```
+
+The game tries to load:
 
 ```text
 public/assets/models/megablocks.glb
