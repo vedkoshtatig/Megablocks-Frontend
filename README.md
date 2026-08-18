@@ -14,13 +14,13 @@ By default the frontend talks to the original-games backend at `http://localhost
 expects the MegaBlock launch contract. Open:
 
 ```text
-http://localhost:9010/original-games/megablock?casinoSessionId=a1-mock-megablock-sc&gameKey=mega-block
+http://localhost:5173/original-games/megablock?casinoSessionId=a1-mock-megablock-sc&gameKey=mega-block
 ```
 
-If Vite starts on a different port, keep the same path and query on that local origin. The
-game exchanges `casinoSessionId` for an original-games token, removes `casinoSessionId`
-from the URL, loads settings, and blocks new-bet controls until `unfinished-bet` has been
-checked.
+If Vite starts on a different port because `5173` is occupied, keep the same path and query
+on that local origin. The game exchanges `casinoSessionId` for an original-games token,
+removes `casinoSessionId` from the URL, loads settings, and blocks new-bet controls until
+`unfinished-bet` has been checked.
 
 For local API development, `.env.local` may provide a stub A1 session so the URL does
 not need query parameters:

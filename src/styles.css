@@ -19,7 +19,25 @@ body {
 }
 
 body {
+  --impact-blur: 0px;
+  --impact-scale: 1;
+  --impact-shake-x: 0px;
+  --impact-shake-y: 0px;
   background: #7bb7ef;
+}
+
+#game-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  transform: translate3d(var(--impact-shake-x), var(--impact-shake-y), 0) scale(var(--impact-scale));
+  transform-origin: center;
+}
+
+body.screen-impact-active #game-screen {
+  filter: blur(var(--impact-blur)) saturate(1.12);
+  will-change: transform, filter;
 }
 
 #game {
@@ -32,6 +50,7 @@ body {
 .hud {
   position: fixed;
   inset: 16px 16px auto 16px;
+  z-index: 4;
   display: flex;
   align-items: center;
   justify-content: space-between;

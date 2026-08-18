@@ -16,7 +16,10 @@ import { PlayerController } from './PlayerController';
 import { createPlaceholderBlocks } from './placeholderBlocks';
 
 const MODEL_URL = '/assets/models/megablocks.glb';
-const HIDDEN_MODEL_OBJECTS = new Set(['Cube_Material_0.001']);
+const HIDDEN_MODEL_OBJECTS = new Set<string>();
+const ENVIRONMENT_MODEL_OBJECTS = new Set(['cube_material_0.001', 'skybox']);
+const ENVIRONMENT_VERTICAL_PARALLAX = 0.5;
+const ENVIRONMENT_Y_ROTATION_DEGREES_PER_SECOND = 0.35;
 const ORBIT_TARGET_OBJECT = 'MOVABLE_Ground_Floor';
 const MAX_ORBIT_DISTANCE = 40;
 const MIN_ORBIT_POLAR_ANGLE = Math.PI * 0.45;
@@ -29,10 +32,20 @@ const STACK_RANDOM_BLENDER_Y_RANGE = 1.4;
 const STACK_RANDOM_Z_ROTATION_DEGREES = 12;
 const TOTAL_STACK_BLOCKS = 24;
 const CAMERA_TOP_PADDING = 3;
-const CAMERA_VIEW_TOP_LIMIT = 0.72;
+const CAMERA_BASE_STACK_VIEW_Y = 0.4;
+const CAMERA_TOP_CLEARANCE_FLOORS = 1;
 const SLIDER_ORBIT_DEGREES_PER_HEIGHT_UNIT = 9;
 const LANDING_SHAKE_DURATION = 0.28;
-const LANDING_SHAKE_STRENGTH = 0.16;
+const LANDING_SHAKE_STRENGTH = 0.2;
+const LANDING_SCREEN_EFFECT_DURATION = 0.34;
+const LANDING_SCREEN_SHAKE_PIXELS = 9;
+const LANDING_SCREEN_BLUR_PIXELS = 3.5;
+const LANDING_SCREEN_SCALE = 1.008;
+const DUST_PARTICLE_COUNT = 104;
+const DUST_DURATION_RANGE = [0.7, 1.18] as const;
+const DUST_GRAVITY = 1.85;
+const DUST_DRAG = 1.4;
+const DUST_EXPANSION = 2.35;
 const COLLAPSE_GRAVITY = 18;
 const BAD_LANDING_TILT_DEGREES = 14;
 const COLLAPSE_CAMERA_FOLLOW_SPEED = 5;
@@ -102,6 +115,25 @@ type CollapsingBlock = {
   velocity: THREE.Vector3;
 };
 
+type EnvironmentObject = {
+  baseRotationY: number;
+  baseY: number;
+  object: THREE.Object3D;
+};
+
+type DustParticle = {
+  age: number;
+  driftPhase: number;
+  driftSpeed: number;
+  driftStrength: number;
+  initialOpacity: number;
+  initialScale: number;
+  lifetime: number;
+  sprite: THREE.Sprite;
+  spin: number;
+  velocity: THREE.Vector3;
+};
+
 type GameStatus = 'idle' | 'placing' | 'active' | 'dropping' | 'cashingOut' | 'won' | 'lost' | 'error';
 
 type MegaBlockUiState = {
@@ -148,6 +180,44 @@ function getAssetUrl(url: string): string {
   return `${url}?updated=${Date.now()}`;
 }
 
+function isEnvironmentObjectName(name: string): boolean {
+  return ENVIRONMENT_MODEL_OBJECTS.has(name.trim().toLowerCase());
+}
+
+function isEnvironmentObject(object: THREE.Object3D): boolean {
+  let current: THREE.Object3D | null = object;
+
+  while (current) {
+    if (isEnvironmentObjectName(current.name)) {
+      return true;
+    }
+
+    current = current.parent;
+  }
+
+  return false;
+}
+
+function createDustTexture(): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+
+  const context = canvas.getContext('2d');
+  if (context) {
+    const gradient = context.createRadialGradient(32, 32, 4, 32, 32, 32);
+    gradient.addColorStop(0, 'rgba(226, 213, 184, 0.72)');
+    gradient.addColorStop(0.45, 'rgba(199, 178, 137, 0.34)');
+    gradient.addColorStop(1, 'rgba(199, 178, 137, 0)');
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
 export class MegablocksGame {
   private readonly scene = new THREE.Scene();
   private readonly clock = new THREE.Clock();
@@ -169,6 +239,9 @@ export class MegablocksGame {
   private readonly dataModeElement = document.querySelector<HTMLElement>('#data-mode');
   private readonly stackParts: StackPart[] = [];
   private readonly collapsingBlocks: CollapsingBlock[] = [];
+  private readonly environmentObjects: EnvironmentObject[] = [];
+  private readonly dustParticles: DustParticle[] = [];
+  private readonly dustTexture = createDustTexture();
  
   private activeDrop: ActiveDrop | null = null;
   private stackAnchor: StackAnchor = {
@@ -181,9 +254,11 @@ export class MegablocksGame {
   private fpsTimer = 0;
   private stackIndex = 0;
   private cameraTargetMinY = 0;
+  private baseStackTopProjectedY: number | null = null;
   private currentStackTopY = 0;
   private collapseCameraStartTargetY = 0;
   private landingShakeRemaining = 0;
+  private landingScreenEffectRemaining = 0;
   private awaitingRoundRestart = false;
   private returningCameraToBase = false;
   private resetInProgress = false;
@@ -283,6 +358,7 @@ export class MegablocksGame {
       this.stackAnchor = this.measureStackAnchor(world, ORBIT_TARGET_OBJECT);
       this.currentStackTopY = this.stackAnchor.topY;
       await this.loadStackAssets(loader);
+      this.frameBaseStackAtViewPosition();
       this.updateControls();
       this.setStatus(this.stackParts.length ? 'Ready to stack floors' : 'Scene loaded');
     } catch (error) {
@@ -463,12 +539,41 @@ export class MegablocksGame {
         return;
       }
 
+      const isEnvironmentRoot = isEnvironmentObjectName(child.name);
+      const isEnvironmentChild = isEnvironmentObject(child);
+
+      if (isEnvironmentRoot) {
+        this.registerEnvironmentObject(child);
+      }
+
       if (child instanceof THREE.Mesh) {
-        child.castShadow = true;
-        child.receiveShadow = true;
+        child.castShadow = !isEnvironmentChild;
+        child.receiveShadow = !isEnvironmentChild;
       }
     });
   }
+
+  private registerEnvironmentObject(object: THREE.Object3D): void {
+    if (this.environmentObjects.some((environment) => environment.object === object)) {
+      return;
+    }
+
+    object.traverse((child) => {
+      child.frustumCulled = false;
+
+      if (child instanceof THREE.Mesh) {
+        child.castShadow = false;
+        child.receiveShadow = false;
+      }
+    });
+
+    this.environmentObjects.push({
+      baseRotationY: object.rotation.y,
+      baseY: object.position.y,
+      object
+    });
+  }
+
   private focusControlsOnObject(root: THREE.Object3D, objectName: string): void {
     const targetObject = root.getObjectByName(objectName);
 
@@ -559,6 +664,122 @@ export class MegablocksGame {
     object.updateMatrixWorld(true);
 
     return object.position.y;
+  }
+
+  private frameBaseStackAtViewPosition(): void {
+    const focusPoint = this.getBaseStackFocusPoint();
+    const desiredProjectedY = 1 - CAMERA_BASE_STACK_VIEW_Y * 2;
+    const shiftAmount = this.getVerticalCameraShiftForProjectedY(focusPoint, desiredProjectedY);
+
+    if (Math.abs(shiftAmount) >= 0.001) {
+      this.shiftCameraVertically(shiftAmount);
+      this.cameraTargetMinY = this.controls.target.y;
+      this.controls.update();
+    }
+
+    this.baseStackTopProjectedY = this.getProjectedY(this.getStackTopPoint(this.stackParts[0]?.topY ?? this.stackAnchor.topY));
+  }
+
+  private getBaseStackFocusPoint(): THREE.Vector3 {
+    const firstPart = this.stackParts[0];
+
+    if (firstPart) {
+      firstPart.object.updateMatrixWorld(true);
+      const firstPartBox = new THREE.Box3().setFromObject(firstPart.object);
+
+      if (!firstPartBox.isEmpty()) {
+        return firstPartBox.getCenter(new THREE.Vector3());
+      }
+    }
+
+    return new THREE.Vector3(
+      this.stackAnchor.center.x,
+      this.stackAnchor.topY,
+      this.stackAnchor.center.z
+    );
+  }
+
+  private getVerticalCameraShiftForProjectedY(point: THREE.Vector3, desiredProjectedY: number): number {
+    const projectWithShift = (shiftY: number): number => {
+      this.camera.position.y += shiftY;
+      this.camera.updateMatrixWorld(true);
+      const projectedY = point.clone().project(this.camera).y;
+      this.camera.position.y -= shiftY;
+      this.camera.updateMatrixWorld(true);
+      return projectedY;
+    };
+
+    let lowerShift = -20;
+    let upperShift = 20;
+    let lowerDelta = projectWithShift(lowerShift) - desiredProjectedY;
+    let upperDelta = projectWithShift(upperShift) - desiredProjectedY;
+
+    for (let expand = 0; lowerDelta * upperDelta > 0 && expand < 4; expand += 1) {
+      lowerShift *= 1.5;
+      upperShift *= 1.5;
+      lowerDelta = projectWithShift(lowerShift) - desiredProjectedY;
+      upperDelta = projectWithShift(upperShift) - desiredProjectedY;
+    }
+
+    if (lowerDelta * upperDelta > 0) {
+      return 0;
+    }
+
+    for (let iteration = 0; iteration < 24; iteration += 1) {
+      const middleShift = (lowerShift + upperShift) / 2;
+      const middleDelta = projectWithShift(middleShift) - desiredProjectedY;
+
+      if (lowerDelta * middleDelta <= 0) {
+        upperShift = middleShift;
+        upperDelta = middleDelta;
+      } else {
+        lowerShift = middleShift;
+        lowerDelta = middleDelta;
+      }
+    }
+
+    return (lowerShift + upperShift) / 2;
+  }
+
+  private getStackTopPoint(topY: number): THREE.Vector3 {
+    return new THREE.Vector3(
+      this.stackAnchor.center.x,
+      topY,
+      this.stackAnchor.center.z
+    );
+  }
+
+  private getCameraClearanceTopY(topY: number): number {
+    return topY + this.getStackFloorHeight() * CAMERA_TOP_CLEARANCE_FLOORS;
+  }
+
+  private getStackFloorHeight(): number {
+    const firstPart = this.stackParts[0];
+    const secondPart = this.stackParts[1];
+
+    if (firstPart && secondPart) {
+      const measuredStep = secondPart.topY - firstPart.topY;
+
+      if (measuredStep > 0) {
+        return measuredStep;
+      }
+    }
+
+    if (firstPart) {
+      firstPart.object.updateMatrixWorld(true);
+      const firstPartBox = new THREE.Box3().setFromObject(firstPart.object);
+
+      if (!firstPartBox.isEmpty()) {
+        return firstPartBox.max.y - firstPartBox.min.y;
+      }
+    }
+
+    return CAMERA_TOP_PADDING;
+  }
+
+  private getProjectedY(point: THREE.Vector3): number {
+    this.camera.updateMatrixWorld(true);
+    return point.clone().project(this.camera).y;
   }
 
   private placeBet = async (): Promise<void> => {
@@ -1101,7 +1322,7 @@ export class MegablocksGame {
     if (progress >= STACK_CONTACT_PROGRESS) {
       if (!drop.hasImpacted) {
         drop.hasImpacted = true;
-        this.landingShakeRemaining = LANDING_SHAKE_DURATION;
+        this.triggerLandingImpact(drop.part, drop.shouldCollapse);
       }
 
       const impactProgress =
@@ -1243,7 +1464,8 @@ export class MegablocksGame {
     this.stackIndex = 0;
     this.activeDrop = null;
     this.currentStackTopY = this.stackAnchor.topY;
-    this.landingShakeRemaining = 0;
+    this.clearLandingImpact();
+    this.clearDustParticles();
   }
 
   private resetRound = (): void => {
@@ -1289,13 +1511,156 @@ export class MegablocksGame {
     this.updateCameraBaseReturn(delta);
     this.controls.update();
     this.updateCameraHeight(delta);
+    this.updateEnvironmentPosition();
+    this.updateDustParticles(delta);
     this.updateCameraSlider();
     this.updateFps(delta);
+    this.updateLandingScreenEffect(delta);
     const shakeOffset = this.getLandingShakeOffset(delta);
     this.camera.position.add(shakeOffset);
     this.renderer.render(this.scene, this.camera);
     this.camera.position.sub(shakeOffset);
   };
+
+  private triggerLandingImpact(part: StackPart, isHeavyImpact: boolean): void {
+    this.landingShakeRemaining = LANDING_SHAKE_DURATION;
+    this.landingScreenEffectRemaining = LANDING_SCREEN_EFFECT_DURATION;
+    document.body.classList.add('screen-impact-active');
+    this.spawnLandingDust(part, isHeavyImpact);
+  }
+
+  private spawnLandingDust(part: StackPart, isHeavyImpact: boolean): void {
+    const box = new THREE.Box3().setFromObject(part.object);
+    const center = box.getCenter(new THREE.Vector3());
+    const width = Math.max(box.max.x - box.min.x, this.stackAnchor.halfWidthX * 2, 1);
+    const depth = Math.max(box.max.z - box.min.z, this.stackAnchor.halfWidthZ * 2, 1);
+    const count = Math.round(DUST_PARTICLE_COUNT * (isHeavyImpact ? 1.6 : 1));
+
+    for (let index = 0; index < count; index += 1) {
+      const angle = Math.random() * Math.PI * 2;
+      const angleJitter = THREE.MathUtils.randFloatSpread(0.75);
+      const travelAngle = angle + angleJitter;
+      const edgeSpread = THREE.MathUtils.randFloat(0.2, 0.92);
+      const opacity = THREE.MathUtils.randFloat(0.38, isHeavyImpact ? 0.82 : 0.7);
+      const initialScale = THREE.MathUtils.randFloat(0.2, isHeavyImpact ? 0.58 : 0.5);
+      const fallsDownward = Math.random() < 0.36;
+      const material = new THREE.SpriteMaterial({
+        color: 0xd8c39c,
+        depthWrite: false,
+        map: this.dustTexture,
+        opacity,
+        transparent: true
+      });
+      const sprite = new THREE.Sprite(material);
+
+      sprite.position.set(
+        center.x + Math.cos(angle) * width * edgeSpread,
+        box.min.y + THREE.MathUtils.randFloat(0.02, isHeavyImpact ? 0.62 : 0.46),
+        center.z + Math.sin(angle) * depth * edgeSpread
+      );
+      sprite.scale.setScalar(initialScale);
+      this.scene.add(sprite);
+
+      this.dustParticles.push({
+        age: 0,
+        driftPhase: Math.random() * Math.PI * 2,
+        driftSpeed: THREE.MathUtils.randFloat(4, 8),
+        driftStrength: THREE.MathUtils.randFloat(0.025, isHeavyImpact ? 0.075 : 0.06),
+        initialOpacity: opacity,
+        initialScale,
+        lifetime: THREE.MathUtils.randFloat(DUST_DURATION_RANGE[0], DUST_DURATION_RANGE[1]),
+        sprite,
+        spin: THREE.MathUtils.randFloatSpread(2.8),
+        velocity: new THREE.Vector3(
+          Math.cos(travelAngle) * THREE.MathUtils.randFloat(0.75, isHeavyImpact ? 2.25 : 1.75),
+          fallsDownward
+            ? THREE.MathUtils.randFloat(-0.65, -0.15)
+            : THREE.MathUtils.randFloat(0.35, isHeavyImpact ? 1.65 : 1.25),
+          Math.sin(travelAngle) * THREE.MathUtils.randFloat(0.75, isHeavyImpact ? 2.25 : 1.75)
+        )
+      });
+    }
+  }
+
+  private updateDustParticles(delta: number): void {
+    for (let index = this.dustParticles.length - 1; index >= 0; index -= 1) {
+      const particle = this.dustParticles[index];
+      particle.age += delta;
+
+      if (particle.age >= particle.lifetime) {
+        this.removeDustParticle(index);
+        continue;
+      }
+
+      const progress = particle.age / particle.lifetime;
+      const material = particle.sprite.material;
+      particle.velocity.y -= DUST_GRAVITY * delta;
+      particle.velocity.multiplyScalar(Math.max(1 - DUST_DRAG * delta, 0.2));
+      particle.sprite.position.addScaledVector(particle.velocity, delta);
+      particle.sprite.position.x +=
+        Math.sin(particle.driftPhase + particle.age * particle.driftSpeed) *
+        particle.driftStrength *
+        (1 - progress);
+      particle.sprite.position.z +=
+        Math.cos(particle.driftPhase + particle.age * particle.driftSpeed * 0.82) *
+        particle.driftStrength *
+        (1 - progress);
+      particle.sprite.scale.setScalar(particle.initialScale * (1 + progress * DUST_EXPANSION));
+      material.opacity = particle.initialOpacity * Math.pow(1 - progress, 1.35);
+      material.rotation += particle.spin * delta;
+    }
+  }
+
+  private clearDustParticles(): void {
+    for (let index = this.dustParticles.length - 1; index >= 0; index -= 1) {
+      this.removeDustParticle(index);
+    }
+  }
+
+  private removeDustParticle(index: number): void {
+    const [particle] = this.dustParticles.splice(index, 1);
+    particle.sprite.removeFromParent();
+    particle.sprite.material.dispose();
+  }
+
+  private updateLandingScreenEffect(delta: number): void {
+    if (this.landingScreenEffectRemaining <= 0) {
+      if (document.body.classList.contains('screen-impact-active')) {
+        this.clearLandingImpact();
+      }
+      return;
+    }
+
+    this.landingScreenEffectRemaining = Math.max(this.landingScreenEffectRemaining - delta, 0);
+    const progress = this.landingScreenEffectRemaining / LANDING_SCREEN_EFFECT_DURATION;
+    const easedProgress = progress * progress;
+    const shakePixels = LANDING_SCREEN_SHAKE_PIXELS * easedProgress;
+    const blurPixels = LANDING_SCREEN_BLUR_PIXELS * Math.min(progress * 1.2, 1);
+
+    document.body.style.setProperty(
+      '--impact-shake-x',
+      `${THREE.MathUtils.randFloatSpread(shakePixels * 2).toFixed(2)}px`
+    );
+    document.body.style.setProperty(
+      '--impact-shake-y',
+      `${THREE.MathUtils.randFloatSpread(shakePixels).toFixed(2)}px`
+    );
+    document.body.style.setProperty('--impact-blur', `${blurPixels.toFixed(2)}px`);
+    document.body.style.setProperty(
+      '--impact-scale',
+      String(1 + (LANDING_SCREEN_SCALE - 1) * easedProgress)
+    );
+  }
+
+  private clearLandingImpact(): void {
+    this.landingShakeRemaining = 0;
+    this.landingScreenEffectRemaining = 0;
+    document.body.classList.remove('screen-impact-active');
+    document.body.style.setProperty('--impact-shake-x', '0px');
+    document.body.style.setProperty('--impact-shake-y', '0px');
+    document.body.style.setProperty('--impact-blur', '0px');
+    document.body.style.setProperty('--impact-scale', '1');
+  }
 
   private getLandingShakeOffset(delta: number): THREE.Vector3 {
     if (this.landingShakeRemaining <= 0) {
@@ -1314,7 +1679,8 @@ export class MegablocksGame {
   }
 
   private updateCameraHeight(delta: number): void {
-    const maxTargetY = Math.max(this.cameraTargetMinY, this.currentStackTopY + CAMERA_TOP_PADDING);
+    const clearanceTopY = this.getCameraClearanceTopY(this.currentStackTopY);
+    const maxTargetY = Math.max(this.cameraTargetMinY, clearanceTopY + CAMERA_TOP_PADDING);
 
     // Keep manual right-mouse panning between the original view and the stack top.
     const clampedTargetY = THREE.MathUtils.clamp(
@@ -1324,24 +1690,17 @@ export class MegablocksGame {
     );
     this.shiftCameraVertically(clampedTargetY - this.controls.target.y);
 
-    const stackTop = new THREE.Vector3(
-      this.stackAnchor.center.x,
-      this.currentStackTopY,
-      this.stackAnchor.center.z
-    );
-    this.camera.updateMatrixWorld();
-    const projectedTop = stackTop.project(this.camera);
+    const stackTop = this.getStackTopPoint(clearanceTopY);
 
-    if (
-      this.activeDrop &&
-      projectedTop.y > CAMERA_VIEW_TOP_LIMIT &&
-      this.controls.target.y < maxTargetY
-    ) {
-      const overflow = projectedTop.y - CAMERA_VIEW_TOP_LIMIT;
-      const desiredShift = overflow * this.camera.position.distanceTo(this.controls.target) * 0.45;
-      const smoothShift = desiredShift * Math.min(delta * 6, 1);
-      const availableShift = maxTargetY - this.controls.target.y;
-      this.shiftCameraVertically(Math.min(smoothShift, availableShift));
+    if (this.activeDrop && this.baseStackTopProjectedY !== null) {
+      const desiredShift = this.getVerticalCameraShiftForProjectedY(stackTop, this.baseStackTopProjectedY);
+      const desiredTargetY = THREE.MathUtils.clamp(
+        this.controls.target.y + desiredShift,
+        this.cameraTargetMinY,
+        maxTargetY
+      );
+      const smoothShift = (desiredTargetY - this.controls.target.y) * Math.min(delta * 6, 1);
+      this.shiftCameraVertically(smoothShift);
     }
 
     this.controls.update();
@@ -1354,6 +1713,23 @@ export class MegablocksGame {
 
     this.camera.position.y += amount;
     this.controls.target.y += amount;
+    this.updateEnvironmentPosition();
+  }
+
+  private updateEnvironmentPosition(): void {
+    if (!this.environmentObjects.length) {
+      return;
+    }
+
+    const cameraHeightOffset = (this.controls.target.y - this.cameraTargetMinY) * ENVIRONMENT_VERTICAL_PARALLAX;
+    const rotationOffset = THREE.MathUtils.degToRad(
+      this.clock.elapsedTime * ENVIRONMENT_Y_ROTATION_DEGREES_PER_SECOND
+    );
+
+    for (const environment of this.environmentObjects) {
+      environment.object.position.y = environment.baseY + cameraHeightOffset;
+      environment.object.rotation.y = environment.baseRotationY + rotationOffset;
+    }
   }
 
   private updateCameraBaseReturn(delta: number): void {
@@ -1389,7 +1765,10 @@ export class MegablocksGame {
       return;
     }
 
-    const maxTargetY = Math.max(this.cameraTargetMinY, this.currentStackTopY + CAMERA_TOP_PADDING);
+    const maxTargetY = Math.max(
+      this.cameraTargetMinY,
+      this.getCameraClearanceTopY(this.currentStackTopY) + CAMERA_TOP_PADDING
+    );
     const sliderMin = Number(this.cameraHeightElement.min);
     const sliderMax = Number(this.cameraHeightElement.max);
     const ratio = (Number(this.cameraHeightElement.value) - sliderMin) / (sliderMax - sliderMin);
@@ -1411,7 +1790,10 @@ export class MegablocksGame {
       return;
     }
 
-    const maxTargetY = Math.max(this.cameraTargetMinY, this.currentStackTopY + CAMERA_TOP_PADDING);
+    const maxTargetY = Math.max(
+      this.cameraTargetMinY,
+      this.getCameraClearanceTopY(this.currentStackTopY) + CAMERA_TOP_PADDING
+    );
     const heightRange = maxTargetY - this.cameraTargetMinY;
     const ratio = heightRange
       ? THREE.MathUtils.clamp((this.controls.target.y - this.cameraTargetMinY) / heightRange, 0, 1)

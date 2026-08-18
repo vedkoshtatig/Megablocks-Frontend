@@ -6,7 +6,6 @@ import type {
   MegaBlockBet,
   MegaBlockBetsResponse,
   MegaBlockClient,
-  MegaBlockDifficulty,
   MegaBlockSettings,
   PlaceMegaBlockBetRequest,
   PlaceMegaBlockBetResponse,
@@ -81,7 +80,7 @@ export class MockMegaBlockClient implements MegaBlockClient {
     this.betCounter += 1;
     const id = String(this.betCounter);
     const nonce = this.betCounter - 39;
-    const crashFloor = chooseCrashFloor(maxFloor, request.difficulty);
+    const crashFloor = chooseCrashFloor(maxFloor);
 
     this.activeRound = {
       betAmount,
@@ -245,21 +244,8 @@ export class MockMegaBlockClient implements MegaBlockClient {
   }
 }
 
-function chooseCrashFloor(maxFloor: number, difficulty: MegaBlockDifficulty): number {
-  const riskByDifficulty: Record<MegaBlockDifficulty, number> = {
-    easy: 0.18,
-    medium: 0.23,
-    hard: 0.3,
-    hardcore: 0.38
-  };
-
-  for (let floor = 1; floor <= maxFloor; floor += 1) {
-    if (Math.random() < riskByDifficulty[difficulty]) {
-      return floor;
-    }
-  }
-
-  return maxFloor + 1;
+function chooseCrashFloor(maxFloor: number): number {
+  return maxFloor;
 }
 
 function multiplierForFloor(floor: number, maxFloor: number): number {

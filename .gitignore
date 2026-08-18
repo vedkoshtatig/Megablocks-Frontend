@@ -1,4 +1,7 @@
 node_modules/
 dist/
+.env.local
 *.log
+.history
+.playwright-mcp/
 megablocks3d-*.png
